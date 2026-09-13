@@ -1399,13 +1399,34 @@ def firefox_capabilities(binary, window, headless=True, extra_prefs=None,
     }}}
 
 
+def safari_capabilities(ios_udid=None):
+    """W3C capabilities for safaridriver: the Mac's own Safari, or a Safari TAB
+    ON AN iOS DEVICE.
+
+    With `ios_udid`, safaridriver on a Mac drives the USB-paired iPhone whose
+    UDID it names: `platformName` is `iOS` and `safari:deviceUDID` selects the
+    device. The device needs Settings > Safari > Advanced > Web Inspector AND
+    Remote Automation on, and the Mac `safaridriver --enable` once. NOT
+    EXECUTED FROM THIS TREE when it landed (2026-09-12): the shape is Apple's
+    documented capability set, and `.claude/skills/iphone-safari-rig` carries
+    the device leg's runbook.
+
+    `acceptInsecureCerts` is absent on BOTH arms: safaridriver refuses it, so a
+    TLS leg needs the mkcert root trusted on the device instead."""
+    always = {"browserName": "safari"}
+    if ios_udid:
+        always["platformName"] = "iOS"
+        always["safari:deviceUDID"] = ios_udid
+    return {"capabilities": {"alwaysMatch": always}}
+
+
 def launch(browser, out_dir, tag, driver_path=None, binary=None,
            window=(1280, 900), headless=True, tmp_root=None,
            ff_prefs=None, extra_env=None, ff_mode="auto", arm="software",
            display=None, chromium_args=(), android=False,
            android_package=None, android_activity=None,
            android_serial=None, android_use_running_app=False,
-           android_keep_app_data=True):
+           android_keep_app_data=True, safari_ios_udid=None):
     """Start the right driver binary + create a session.
     Returns (DriverProcess, Session, info_dict).
 
@@ -1701,9 +1722,15 @@ def launch(browser, out_dir, tag, driver_path=None, binary=None,
         if not driver_path:
             raise WebDriverError("no safaridriver binary; pass --driver")
         argv = [driver_path, "-p", str(port)]
-        caps = {"capabilities": {"alwaysMatch": {"browserName": "safari"}}}
-        info = {"binary": "safari (system)",
+        caps = safari_capabilities(safari_ios_udid)
+        info = {"binary": ("safari (iOS device %s)" % safari_ios_udid
+                           if safari_ios_udid else "safari (system)"),
                 "driver_version": _version_of(driver_path)}
+        if safari_ios_udid:
+            # The phone's own compositor renders and nothing here owns its
+            # display: the row names the device, never this Mac's window.
+            info["ios_device_udid"] = safari_ios_udid
+            info["gpu_mode"] = "ios-device"
     else:
         raise ValueError("browser must be chromium, firefox or safari")
     info["driver_path"] = driver_path
@@ -3603,6 +3630,44 @@ return { row: row, allocs: allocs, console_total: C.length };
 """
 
 
+# The wall rig's line scrape (M1, `--until-death`). Every line of the five
+# families a wall row is read from -- out of the console ring, the error ring
+# and the prelude's retained fallback copies -- handed back WHOLE and tagged
+# with the document's `t0`, so the host can tell one page load's lines from the
+# next one's after a reload, and so the reader that turns them into a row is
+# the same Python a beaconed log goes through (`wall_reading`). Each needle is
+# spelled as its own `indexOf` literal, which is what the JS gate's stub feeder
+# reads (`rig_js_tests`) and what `WALL_LINE_NEEDLES` is pinned against.
+WALL_LINES_PROBE = r"""
+var C = window.__rig_console || [];
+var E = window.__rig_errors || [];
+var F = window.__rig_fallbacks || [];
+var lines = [];
+function keep(e) {
+  var m = String((e && e.msg) || "");
+  if (m.indexOf("budget state:") >= 0 || m.indexOf("heap census (") >= 0
+      || m.indexOf("alloc failed:") >= 0
+      || m.indexOf("could not instantiate with a") >= 0
+      || m.indexOf("budget pressure:") >= 0) {
+    lines.push({ t: e.t, lvl: e.lvl || e.kind || null, msg: m });
+  }
+}
+for (var i = 0; i < C.length; i++) keep(C[i]);
+for (var j = 0; j < E.length; j++) keep(E[j]);
+for (var k = 0; k < F.length; k++) keep(F[k]);
+return { lines: lines, t0: (window.__rig && window.__rig.t0) || null,
+         now: Date.now() };
+"""
+
+# The calibrate page's own state (`.github/browser-rig/calibrate.html`), copied
+# through JSON so the wire carries plain data.
+CALIBRATE_PROBE = r"""
+var c = window.__calibrate;
+if (!c) return null;
+return JSON.parse(JSON.stringify(c));
+"""
+
+
 FRAME_LINE_PROBE = r"""
 var C = window.__rig_console || [];
 var svc_interact_re = /frame service \(interact\): n=(\d+), p50=(\d+|none|over) us, p90=(\d+|none|over) us, p99=(\d+|none|over) us, hist=([0-9,]+)/;
@@ -4908,7 +4973,7 @@ class CensusSampler:
                "asked", "admitted", "would_refuse", "refused",
                "alloc_failed_total")
 
-    def __init__(self, session, path, interval):
+    def __init__(self, session, path, interval, wall=False):
         self.session = session
         self.path = path
         self.interval = interval
@@ -4918,6 +4983,21 @@ class CensusSampler:
         # size at a later instant keys differently and is kept.
         self.allocs = {}
         self.errors = 0
+        # DEATHS, on every sampled leg and read by `--until-death`. `load_t0`
+        # is the page's `window.__rig.t0`, which the prelude stamps once per
+        # DOCUMENT: a different value on a later sample is a different
+        # document, i.e. the page was reloaded under the leg -- which is what a
+        # killed tab looks like on iOS. A driver error that says the page is
+        # gone is the desktop's version of the same event. Neither is written
+        # into a column: the TSV's format is other legs' contract, so a death
+        # is a `#` note line there and a record in `record()`.
+        self.load_t0 = None
+        self.deaths = []
+        self.consecutive_errors = 0
+        # `wall`: also take every wall-family line, whole (WALL_LINES_PROBE),
+        # keyed on (document, page stamp, message).
+        self.wall = wall
+        self.wall_lines = {}
         self.fh = open(path, "a", buffering=1)
         self.fh.write("#columns\t%s\n" % "\t".join(self.COLUMNS))
 
@@ -4927,50 +5007,88 @@ class CensusSampler:
         self.fh.write("# %s\n" % text)
 
     def sample(self, leg_s):
+        probe_error = None
         try:
             sig = self.session.execute(SAMPLE_PROBE) or {}
+            self.consecutive_errors = 0
         except Exception as e:                      # noqa: BLE001 -- a dead
             # page must not end the leg here: the FAILURE is the finding, and
             # the row records that the probe could not run.
             self.errors += 1
-            sig = {"row": {}, "probe_error": str(e)[:200]}
+            self.consecutive_errors += 1
+            probe_error = str(e)
+            sig = {"row": {}, "probe_error": probe_error[:200]}
         r = dict(sig.get("row") or {})
         for a in sig.get("allocs") or []:
             self.allocs[(a.get("t"), str(a.get("msg")))] = a
-        row = {
-            "t_host_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "leg_s": leg_s,
-            "t_page_ms": r.get("now"),
-            "loadavg1": _loadavg(),
-            "cadence_n": r.get("cadence_n"),
-            "cadence_page_t_ms": r.get("cadence_t"),
-            "linear_page_mib": r.get("linear_page_mib"),
-            "linear_page_ceiling_mib": r.get("heap_max_page_mib"),
-            "linear_worker_mib": r.get("linear_worker_mib"),
-            "linear_worker_ceiling_mib": r.get("heap_max_worker_mib"),
-            "live_page_mib": r.get("live_page_mib"),
-            "live_worker_mib": r.get("live_worker_mib"),
-            "overlay_grids_b": r.get("overlay_grid_b"),
-            "loop_scans_b": r.get("loop_scan_b"),
-            "upload_pending_b": r.get("upload_pending_b"),
-            "resident_total_b": r.get("resident_total_b"),
-            "upload_bands": r.get("upload_bands"),
-            "upload_blocking_b": r.get("upload_blocking_b"),
-            "upload_whole_b": r.get("upload_whole_b"),
-            "prep_passes": r.get("prep_passes"),
-            "upload_apply_us": r.get("upload_apply_us"),
-            "census_linear_b": r.get("census_linear_b"),
-            "census_instance": r.get("census_instance"),
-            "asked": r.get("asked"),
-            "admitted": r.get("admitted"),
-            "would_refuse": r.get("would_refuse"),
-            "refused": r.get("refused"),
-            "alloc_failed_total": len(self.allocs),
-        }
+        row = census_row(r, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                         leg_s, _loadavg(), len(self.allocs))
         self.rows.append(row)
         self.fh.write("\t".join(
             "-" if row[c] is None else str(row[c]) for c in self.COLUMNS) + "\n")
+        self._watch_for_death(r.get("t0"), probe_error, leg_s)
+        if self.wall and probe_error is None:
+            self._take_wall_lines()
         return row
+
+    def last_good_row(self, skip_last=False):
+        """The newest row a probe actually answered, before this sample when
+        `skip_last` -- the reading a death is read from."""
+        rows = self.rows[:-1] if skip_last else self.rows
+        for row in reversed(rows):
+            if row.get("t_page_ms") is not None:
+                return row
+        return None
+
+    def _watch_for_death(self, t0, probe_error, leg_s):
+        if probe_error is not None:
+            kind = page_death_kind(probe_error)
+            # Once per event: a crash reads on the FIRST failure, a page that
+            # answers nothing on the UNRESPONSIVE_PROBES-th, and the failures
+            # after either belong to the same death.
+            if kind is not None and self.consecutive_errors == 1:
+                pass
+            elif kind is None and self.consecutive_errors == UNRESPONSIVE_PROBES:
+                kind = "unresponsive"
+            else:
+                return
+            self.deaths.append({"kind": kind, "leg_s": leg_s,
+                                "error": probe_error[:300],
+                                "load_t0": self.load_t0,
+                                "last_row_before": self.last_good_row(True)})
+            self.note("death %d: %s at leg_s=%s -- %s"
+                      % (len(self.deaths), kind, leg_s, probe_error[:160]))
+            return
+        if t0 is None:
+            return
+        if self.load_t0 is None:
+            self.load_t0 = t0
+            return
+        if t0 != self.load_t0:
+            self.deaths.append({"kind": "reload", "leg_s": leg_s,
+                                "load_t0": self.load_t0, "new_load_t0": t0,
+                                "last_row_before": self.last_good_row(True)})
+            self.note("death %d: reload at leg_s=%s (page t0 %s -> %s)"
+                      % (len(self.deaths), leg_s, self.load_t0, t0))
+            self.load_t0 = t0
+
+    def _take_wall_lines(self):
+        try:
+            got = self.session.execute(WALL_LINES_PROBE) or {}
+        except Exception:                            # noqa: BLE001 -- the
+            # SAMPLE_PROBE row above already recorded whether the page answers.
+            return
+        load = got.get("t0")
+        for e in got.get("lines") or []:
+            msg = str((e or {}).get("msg") or "")
+            key = (load, e.get("t"), msg)
+            if key not in self.wall_lines:
+                self.wall_lines[key] = {"t": e.get("t"), "msg": msg,
+                                        "lvl": e.get("lvl"), "load": load}
+
+    def wall_line_list(self):
+        return sorted(self.wall_lines.values(),
+                      key=lambda e: (e["load"] or 0, e["t"] or 0))
 
     def peak_page_mib(self):
         vals = [r["linear_page_mib"] for r in self.rows
@@ -4996,13 +5114,640 @@ class CensusSampler:
                 "last_leg_s": (self.rows[-1]["leg_s"] if self.rows else None),
                 "peak_linear_page_mib": self.peak_page_mib(),
                 "linear_page_ceiling_mib": self.page_ceiling_mib(),
-                "alloc_failures": len(self.allocs)}
+                "alloc_failures": len(self.allocs),
+                "deaths": len(self.deaths),
+                "death_events": self.deaths}
 
     def close(self):
         try:
             self.fh.close()
         except Exception:                            # noqa: BLE001
             pass
+
+
+# --------------------------------------------------------------------------
+# The web memory wall (M1): `--until-death` legs, the calibrate page, and the
+# ONE reader a driven leg and a beaconed log both go through.
+# --------------------------------------------------------------------------
+
+# How many probes in a row may fail before a page that answers nothing is read
+# as dead. One failure is a busy page (a GC pause, a long frame); three at the
+# sampler's 2 s interval is six seconds of a document that cannot run a line.
+UNRESPONSIVE_PROBES = 3
+
+# Driver error text that means the DOCUMENT is gone -- the renderer crashed,
+# the tab was discarded, the WebContent process died -- rather than that one
+# script failed. Each driver spells it its own way; matched case-blind.
+PAGE_DEATH_SIGNATURES = (
+    "tab crashed",
+    "session deleted because of page crash",
+    "page crash",
+    "browsing context has been discarded",
+    "no such window",
+    "target window already closed",
+    "web view not found",
+    "webcontent process",
+    "invalid session id",
+)
+
+
+def page_death_kind(text):
+    """`"crash"` when a driver error says the page is gone, else None."""
+    low = str(text or "").lower()
+    return "crash" if any(s in low for s in PAGE_DEATH_SIGNATURES) else None
+
+
+class LegDied(Exception):
+    """`--until-death`: the page died under the leg. A READING, never a
+    failure: the leg ends here and its row is what was seen before it."""
+
+    def __init__(self, event):
+        super().__init__("the page died under the leg (%s)" % event.get("kind"))
+        self.event = event
+
+
+def census_row(r, t_host_iso, leg_s, loadavg1, alloc_failed_total):
+    """One `CensusSampler.COLUMNS` row out of a `SAMPLE_PROBE`-shaped reading.
+    Shared by the driven sampler and `analyze-console`, so a TSV written from a
+    beaconed log has a driven leg's columns AND their meanings."""
+    return {
+        "t_host_iso": t_host_iso,
+        "leg_s": leg_s,
+        "t_page_ms": r.get("now"),
+        "loadavg1": loadavg1,
+        "cadence_n": r.get("cadence_n"),
+        "cadence_page_t_ms": r.get("cadence_t"),
+        "linear_page_mib": r.get("linear_page_mib"),
+        "linear_page_ceiling_mib": r.get("heap_max_page_mib"),
+        "linear_worker_mib": r.get("linear_worker_mib"),
+        "linear_worker_ceiling_mib": r.get("heap_max_worker_mib"),
+        "live_page_mib": r.get("live_page_mib"),
+        "live_worker_mib": r.get("live_worker_mib"),
+        "overlay_grids_b": r.get("overlay_grid_b"),
+        "loop_scans_b": r.get("loop_scan_b"),
+        "upload_pending_b": r.get("upload_pending_b"),
+        "resident_total_b": r.get("resident_total_b"),
+        "upload_bands": r.get("upload_bands"),
+        "upload_blocking_b": r.get("upload_blocking_b"),
+        "upload_whole_b": r.get("upload_whole_b"),
+        "prep_passes": r.get("prep_passes"),
+        "upload_apply_us": r.get("upload_apply_us"),
+        "census_linear_b": r.get("census_linear_b"),
+        "census_instance": r.get("census_instance"),
+        "asked": r.get("asked"),
+        "admitted": r.get("admitted"),
+        "would_refuse": r.get("would_refuse"),
+        "refused": r.get("refused"),
+        "alloc_failed_total": alloc_failed_total,
+    }
+
+
+def sample_probe_patterns(source=None):
+    """`{js name: compiled pattern}` for every `var sample_*_re = /.../;` in
+    `SAMPLE_PROBE`, lifted out of the probe rather than retyped, so the Python
+    reading of a beaconed log and the page's own reading are one pattern set.
+    They use only syntax JavaScript and Python agree on, and the selftest
+    names any that stops compiling."""
+    src = SAMPLE_PROBE if source is None else source
+    return {m.group(1): re.compile(m.group(2))
+            for m in re.finditer(r"^var (sample_[a-z0-9_]+_re) = /(.*)/;$",
+                                 src, re.M)}
+
+
+def sample_row_from_lines(lines, patterns=None):
+    """`SAMPLE_PROBE`'s row, computed in Python over `{t, msg}` lines in order:
+    the LAST line of each family wins, as in the page's own loop. Returns
+    `(row, allocs)`."""
+    P = patterns or sample_probe_patterns()
+    row = dict.fromkeys((
+        "cadence_n", "cadence_t", "linear_page_mib", "linear_worker_mib",
+        "linear_t", "heap_max_page_mib", "heap_max_worker_mib", "asked",
+        "admitted", "would_refuse", "refused", "live_page_mib",
+        "live_worker_mib", "census_instance", "loop_scan_b", "overlay_grid_b",
+        "upload_pending_b", "resident_total_b", "census_linear_b", "census_t",
+        "upload_bands", "upload_blocking_b", "upload_whole_b", "prep_passes",
+        "upload_apply_us"))
+    allocs = []
+    for e in lines:
+        m, t = str((e or {}).get("msg") or ""), (e or {}).get("t")
+        x = P["sample_cadence_re"].search(m)
+        if x:
+            row["cadence_n"], row["cadence_t"] = int(x.group(1)), t
+        x = P["sample_linear_re"].search(m)
+        if x:
+            row["linear_page_mib"] = int(x.group(1))
+            row["linear_worker_mib"] = int(x.group(2))
+            row["linear_t"] = t
+            hm = P["sample_heap_max_re"].search(m)
+            if hm:
+                row["heap_max_page_mib"] = int(hm.group(1))
+                row["heap_max_worker_mib"] = int(hm.group(2))
+            lv = P["sample_live_re"].search(m)
+            if lv:
+                row["live_page_mib"] = int(lv.group(1))
+                row["live_worker_mib"] = int(lv.group(2))
+            ad = P["sample_admission_re"].search(m)
+            if ad:
+                (row["asked"], row["admitted"], row["would_refuse"],
+                 row["refused"]) = (int(g) for g in ad.groups())
+        x = P["sample_census_loop_re"].search(m)
+        if x:
+            row["census_instance"] = x.group(1)
+            row["loop_scan_b"] = int(x.group(2))
+            row["census_t"] = t
+            g = P["sample_census_grids_re"].search(m)
+            if g:
+                row["overlay_grid_b"] = int(g.group(1))
+            up = P["sample_census_upload_re"].search(m)
+            if up:
+                row["upload_pending_b"] = int(up.group(1))
+            rt = P["sample_census_resident_re"].search(m)
+            if rt:
+                row["resident_total_b"] = int(rt.group(1))
+                row["census_linear_b"] = int(rt.group(2))
+        x = P["sample_uploads_re"].search(m)
+        if x:
+            row["upload_whole_b"] = int(x.group(3))
+            row["upload_bands"] = int(x.group(4))
+            row["upload_blocking_b"] = int(x.group(6))
+        x = P["sample_prep_re"].search(m)
+        if x:
+            row["prep_passes"] = int(x.group(1))
+            row["upload_apply_us"] = int(x.group(3))
+        if "alloc failed:" in m:
+            allocs.append({"t": t, "msg": m})
+    return row, allocs
+
+
+# The five families a wall row is read from. Each is an `indexOf` literal in
+# WALL_LINES_PROBE; the selftest holds the two spellings together.
+WALL_LINE_NEEDLES = ("budget state:", "heap census (", "alloc failed:",
+                     INSTANTIATE_FALLBACK_NEEDLE, "budget pressure:")
+
+
+def is_wall_line(msg):
+    m = str(msg or "")
+    return any(n in m for n in WALL_LINE_NEEDLES)
+
+
+_CENSUS_HEAD_RE = re.compile(r"heap census \(([a-z0-9 -]+)\): (.*)$")
+_CENSUS_FAMILY_RE = re.compile(r"^([a-z][a-z0-9 ]*?) (\d+) B$")
+_CENSUS_RESIDENT_RE = re.compile(r"resident total (\d+) B of (\d+) B linear")
+
+
+def census_families(msg):
+    """`heap census (<instance>): <family> <n> B, ...` -> `(instance, {family:
+    bytes})` for every family the line carries, plus `resident total` and
+    `linear`. Read by SHAPE rather than from a list, so a family the census
+    grows is on the row the day it is written."""
+    m = _CENSUS_HEAD_RE.search(str(msg or ""))
+    if not m:
+        return None, {}
+    fams = {}
+    for part in re.split(r"[,;] ", m.group(2)):
+        x = _CENSUS_FAMILY_RE.match(part.strip())
+        if x:
+            fams[x.group(1)] = int(x.group(2))
+    rt = _CENSUS_RESIDENT_RE.search(m.group(2))
+    if rt:
+        fams["resident total"] = int(rt.group(1))
+        fams["linear"] = int(rt.group(2))
+    return m.group(1), fams
+
+
+# The columns a wall row prints and a route comparison checks, in order.
+WALL_ROW_COLUMNS = (
+    "booted", "ticks", "page_hw_mib", "worker_hw_mib", "sum_hw_mib",
+    "page_ceiling_mib", "worker_ceiling_mib", "census_last_resident_b",
+    "alloc_failures", "instantiate_fallbacks", "budget_pressure_events",
+    "deaths", "ladder_largest_mib", "wall_mib", "residue_mib")
+
+
+def wall_row_text(wall):
+    wall = wall or {}
+    return " ".join("%s=%s" % (k, "-" if wall.get(k) is None else wall.get(k))
+                    for k in WALL_ROW_COLUMNS)
+
+
+def _wall_calibrate_terms(calibrate):
+    """`(wall_mib, ladder_largest_mib, ladder_ok, why_no_wall)` out of a
+    calibrate verdict. A doctored run is a control and is never a wall."""
+    if not calibrate:
+        return None, None, None, "no calibrate leg was joined to this row"
+    largest = calibrate.get("ladder_largest_mib")
+    ok = calibrate.get("ladder_ok")
+    if calibrate.get("doctored"):
+        return (None, largest, ok,
+                "the joined calibrate run was DOCTORED: a control, not a wall")
+    if calibrate.get("ended_by") not in ("death", "refusal", "cap"):
+        return (None, largest, ok, "the joined calibrate run has no end (%r)"
+                % calibrate.get("ended_by"))
+    return calibrate.get("survived_mib"), largest, ok, None
+
+
+def wall_reading(lines, deaths=None, calibrate=None):
+    """**The wall row, read ONE way whichever route its lines took.**
+
+    A driven leg's lines come off the page's rings through WALL_LINES_PROBE;
+    a phone nobody drives beacons the same entries to `serve.py`, and
+    `analyze-console` reads them back out of the log. Both arrive here as
+    `{t, msg, load}` -- `load` is the document's `t0` -- and nothing about the
+    route reaches the arithmetic, so the two can only disagree where the LINES
+    disagree.
+
+    The reading window is the FIRST page load: everything before the first
+    death. `deaths` is the event list when a driver saw them, one event per
+    later load for a beaconed log, and None for a text dump, which cannot see
+    a reload and says so rather than reading zero. Every figure's denominator
+    is written into `basis` beside it."""
+    seen = {}
+    for e in lines or []:
+        e = e or {}
+        key = (e.get("load"), e.get("t"), e.get("order"),
+               str(e.get("msg") or ""))
+        seen.setdefault(key, e)
+    ordered = sorted(seen.values(), key=lambda e: (
+        e.get("load") is None, e.get("load") or 0,
+        e.get("t") if e.get("t") is not None else 0, e.get("order") or 0))
+    loads = []
+    for e in ordered:
+        if e.get("load") not in loads:
+            loads.append(e.get("load"))
+    P = sample_probe_patterns()
+
+    def summarise(ls):
+        s = {"lines": len(ls), "ticks": 0, "page_hw_mib": None,
+             "worker_hw_mib": None, "sum_hw_mib": None,
+             "page_ceiling_mib": None, "worker_ceiling_mib": None,
+             "census_last": None, "budget_pressure_events": 0}
+        for e in ls:
+            m = str(e.get("msg") or "")
+            x = P["sample_linear_re"].search(m)
+            if x:
+                p, w = int(x.group(1)), int(x.group(2))
+                s["ticks"] += 1
+                s["page_hw_mib"] = max(p, s["page_hw_mib"] or 0)
+                s["worker_hw_mib"] = max(w, s["worker_hw_mib"] or 0)
+                s["sum_hw_mib"] = max(p + w, s["sum_hw_mib"] or 0)
+                hm = P["sample_heap_max_re"].search(m)
+                if hm:
+                    s["page_ceiling_mib"] = int(hm.group(1))
+                    s["worker_ceiling_mib"] = int(hm.group(2))
+            if "heap census (page)" in m:
+                _instance, fams = census_families(m)
+                s["census_last"] = {"t": e.get("t"), "families": fams}
+            if "budget pressure:" in m:
+                s["budget_pressure_events"] += 1
+        return s
+
+    first = [e for e in ordered if loads and e.get("load") == loads[0]]
+    s = summarise(first)
+    allocs = [{"t": e.get("t"), "msg": str(e.get("msg"))} for e in first
+              if "alloc failed:" in str(e.get("msg") or "")]
+    alloc = alloc_failure_verdict(allocs)
+    hook_page, _hook_ceiling = alloc_line_page_levels(allocs)
+    fallbacks = instantiate_fallback_verdict(first)
+    page_hw = max([v for v in (s["page_hw_mib"], hook_page) if v is not None],
+                  default=None)
+    wall_mib, largest, ladder_ok, why_no_wall = _wall_calibrate_terms(calibrate)
+    census = s["census_last"]
+    per_load = []
+    for ld in loads:
+        ls = summarise([e for e in ordered if e.get("load") == ld])
+        per_load.append({"load": ld, "lines": ls["lines"], "ticks": ls["ticks"],
+                         "page_hw_mib": ls["page_hw_mib"],
+                         "worker_hw_mib": ls["worker_hw_mib"],
+                         "sum_hw_mib": ls["sum_hw_mib"]})
+    return {
+        "measured": s["ticks"] > 0,
+        "booted": s["ticks"] > 0,
+        "ticks": s["ticks"],
+        "page_hw_mib": page_hw,
+        "page_hw_budget_state_mib": s["page_hw_mib"],
+        "page_hw_alloc_hook_mib": hook_page,
+        "worker_hw_mib": s["worker_hw_mib"],
+        "sum_hw_mib": s["sum_hw_mib"],
+        "page_ceiling_mib": s["page_ceiling_mib"],
+        "worker_ceiling_mib": s["worker_ceiling_mib"],
+        "census_last": census,
+        "census_last_resident_b": ((census or {}).get("families") or {}).get(
+            "resident total"),
+        "alloc_failures": alloc["count"],
+        "alloc_instances": alloc["instances"],
+        "first_alloc_failure": alloc["first"],
+        "instantiate_fallbacks": fallbacks["count"],
+        "instantiate_fallback_page": fallbacks["page_count"],
+        "instantiate_fallback_worker": fallbacks["worker_count"],
+        "budget_pressure_events": s["budget_pressure_events"],
+        "deaths": None if deaths is None else len(deaths),
+        "death_kinds": (None if deaths is None
+                        else [d.get("kind") for d in deaths]),
+        "loads": per_load,
+        "ladder_largest_mib": largest,
+        "ladder_ok": ladder_ok,
+        "wall_mib": wall_mib,
+        "why_no_wall": why_no_wall,
+        "calibrate_ended_by": (calibrate or {}).get("ended_by"),
+        "residue_mib": (wall_mib - s["sum_hw_mib"]
+                        if wall_mib is not None and s["sum_hw_mib"] is not None
+                        else None),
+        "basis": {
+            "reading_window": "the FIRST page load: every line before the "
+                              "first death",
+            "page_hw_mib": "the higher of the highest page `linear` figure on "
+                           "a `budget state:` tick and the page level an "
+                           "`alloc failed: ... in page` line reports (MiB)",
+            "worker_hw_mib": "the highest worker `linear` figure on a "
+                             "`budget state:` tick (MiB)",
+            "sum_hw_mib": "the highest page+worker `linear` pair on ONE tick, "
+                          "never the page peak plus the worker peak (MiB)",
+            "ceilings": "`heap max a/b` on the last tick (MiB)",
+            "census_last": "the last `heap census (page)` line of the window",
+            "wall_mib": "MiB of incompressible, touched linear memory the "
+                        "calibrate leg on the same device and browser "
+                        "survived",
+            "residue_mib": "wall_mib minus sum_hw_mib: negative means the "
+                           "app's linear memory ALONE passed that device's "
+                           "measured wall",
+            "deaths": "reloads and crashes a driver saw; page loads after the "
+                      "first in a beaconed log; null for a text dump, which "
+                      "cannot see one",
+        },
+    }
+
+
+def until_death_event(e, sampler):
+    """The death a leg-ending exception IS, or None when it is a failure."""
+    if sampler is None:
+        return None
+    if isinstance(e, LegDied):
+        return e.event
+    kind = page_death_kind(str(e))
+    if kind is None:
+        return None
+    ev = {"kind": kind, "leg_s": None, "error": str(e)[:300],
+          "load_t0": sampler.load_t0, "last_row_before": sampler.last_good_row(),
+          "outside_sampler": True}
+    sampler.deaths.append(ev)
+    return ev
+
+
+def load_calibrate_json(path):
+    """A calibrate leg's `<tag>.json` -> its `calibrate` verdict, or None."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("calibrate")
+    except (OSError, ValueError):
+        return None
+
+
+def finish_until_death_leg(args, result, session, sampler, died, stage):
+    """`--until-death`, the page died under the leg: the death is the reading.
+    Returns the exit code."""
+    stage("until-death", kind=died.get("kind"), leg_s=died.get("leg_s"))
+    if session is not None:
+        try:
+            result["rig_signal_after_death"] = session.execute(
+                RIG_ERRORS_PROBE, timeout=20)
+        except Exception as diag:                    # noqa: BLE001 -- a
+            # crashed session has no page to ask.
+            result["rig_signal_after_death"] = "unavailable: %s" % str(diag)[:200]
+    result["census_samples"] = sampler.record()
+    sampler.close()
+    result["wall"] = wall_reading(
+        sampler.wall_line_list(), deaths=sampler.deaths,
+        calibrate=load_calibrate_json(getattr(args, "calibrate_json", None)))
+    result["pass"] = bool(result["wall"]["measured"])
+    result["verdict"] = {
+        "mode": "until-death", "died": True, "first_death_kind": died.get("kind"),
+        "measured": result["wall"]["measured"],
+        "booted": bool(((result.get("boot") or {}).get("probe") or {}).get(
+            "booted")),
+        "cross_origin_isolated": (result.get("env") or {}).get(
+            "cross_origin_isolated")}
+    stage("wall", **{k: result["wall"].get(k) for k in WALL_ROW_COLUMNS})
+    return EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
+
+
+# ---- the calibrate page's two routes ----------------------------------------
+
+CALIBRATE_STEP_PHASES = ("ladder", "growing", "ended")
+
+
+def report_records_from_text(text):
+    """Every JSON line of a `serve.py --report-log` file, oldest first, and the
+    count of lines that did not parse (a server killed mid-write tears one)."""
+    recs, torn = [], 0
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            recs.append(json.loads(raw))
+        except ValueError:
+            torn += 1
+    return recs, torn
+
+
+def read_report_log(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return report_records_from_text(fh.read())
+
+
+def calibrate_route_of_record(rec):
+    """A step record, or the page's own readback of one (same keys, with
+    `ended_by` and `phase_at_end` already named), as the route shape
+    `calibrate_verdict` compares."""
+    if not rec:
+        return None
+    ended_by = rec.get("ended_by") or (
+        rec.get("end") if rec.get("phase") == "ended" else "death")
+    die, survived = rec.get("die_at_mib"), rec.get("survived_mib")
+    return {
+        "ended_by": ended_by,
+        "survived_mib": survived,
+        "attempting_mib": rec.get("attempting_mib"),
+        "phase_at_end": rec.get("phase_at_end") or rec.get("phase"),
+        "attempting_rung_mib": rec.get("attempting_rung_mib"),
+        "at_maximum": rec.get("at_maximum"),
+        "error": rec.get("error"),
+        "simulated": bool(ended_by == "death" and die is not None
+                          and survived is not None and survived >= die),
+        "die_at_mib": die, "cap_mib": rec.get("cap_mib"),
+        "step_mib": rec.get("step_mib"),
+        "memory_maximum_mib": rec.get("memory_maximum_mib"),
+        "ladder": rec.get("ladder"),
+        "page_ladder_verdict": rec.get("ladder_verdict"),
+        "ask": rec.get("ask"),
+        "doctored": list(rec.get("doctored") or []),
+        "coi": rec.get("coi"), "ua": rec.get("ua"), "seq": rec.get("seq"),
+    }
+
+
+def calibrate_report_route(records, run):
+    """The run as its /rig/report beacons saw it: the highest-`seq` STEP
+    record of `run`. Independent of localStorage by construction -- the
+    readback record a later load beacons is not a step and is not read."""
+    steps = [r.get("body") for r in records
+             if r.get("route") == "/rig/report"
+             and isinstance(r.get("body"), dict)
+             and r["body"].get("kind") == "calibrate"
+             and r["body"].get("run") == run
+             and r["body"].get("phase") in CALIBRATE_STEP_PHASES]
+    if not steps:
+        return None
+    last = max(steps, key=lambda b: (b.get("seq") if isinstance(b.get("seq"), int)
+                                     else -1))
+    out = calibrate_route_of_record(last)
+    out["steps"] = len(steps)
+    return out
+
+
+def ladder_verdict(ladder, ask):
+    """Did the rungs THIS BUILD asks for construct? Recomputed from the rungs
+    and the ask rather than read off the page's own boolean, so a page whose
+    arithmetic went wrong cannot turn a refused rung green."""
+    ladder = ladder or []
+    ask = ask or {}
+
+    def rung(mib):
+        for r in ladder:
+            if r.get("mib") == mib:
+                return bool(r.get("ok"))
+        return None
+
+    page = rung(ask.get("page_mib")) if ask.get("page_mib") is not None else None
+    worker = (rung(ask.get("worker_mib"))
+              if ask.get("worker_mib") is not None else None)
+    oks = [r.get("mib") for r in ladder if r.get("ok")]
+    out = {"ok": page is True and worker is True,
+           "largest_mib": max(oks) if oks else None,
+           "page_ask_mib": ask.get("page_mib"),
+           "worker_ask_mib": ask.get("worker_mib"),
+           "page_rung_ok": page, "worker_rung_ok": worker,
+           "refused_mib": [r.get("mib") for r in ladder if not r.get("ok")],
+           "why": None}
+    if not ladder:
+        out["why"] = ("no ladder was read: the run died before it, or the "
+                      "record carries none")
+    elif ask.get("page_mib") is None:
+        out["why"] = ("the app's ask is unknown (heap.js could not be read), so "
+                      "no rung was held against it")
+    elif not out["ok"]:
+        out["why"] = ("this build asks %s MiB for the page and %s MiB for the "
+                      "worker, and the %s rung did not construct"
+                      % (ask.get("page_mib"), ask.get("worker_mib"),
+                         " and ".join(n for n, v in (("page", page),
+                                                     ("worker", worker))
+                                      if v is not True)))
+    return out
+
+
+def calibrate_verdict(ls_route, report_route, expect_death_at=None):
+    """The calibrate leg's verdict over its two routes. RED when the ladder
+    refused a rung this build asks for, when the routes disagree, when neither
+    answered, or when an expected death did not read back on BOTH routes."""
+    primary = report_route or ls_route or {}
+    lv = ladder_verdict(primary.get("ladder"), primary.get("ask"))
+    page_lv = primary.get("page_ladder_verdict") or {}
+    errors, notes = [], []
+    out = {"ls": ls_route, "report": report_route, "ladder_verdict": lv,
+           "ladder_ok": lv["ok"], "ladder_largest_mib": lv["largest_mib"],
+           "ask": primary.get("ask"), "ended_by": primary.get("ended_by"),
+           "survived_mib": primary.get("survived_mib"),
+           "simulated": primary.get("simulated"),
+           "doctored": primary.get("doctored") or [],
+           "coi": primary.get("coi"), "routes_agree": None}
+    if not ls_route and not report_route:
+        errors.append("neither route answered: no localStorage readback and no "
+                      "/rig/report step for this run")
+    elif ls_route and report_route:
+        agree = (ls_route.get("ended_by") == report_route.get("ended_by")
+                 and ls_route.get("survived_mib") == report_route.get("survived_mib"))
+        out["routes_agree"] = agree
+        if not agree:
+            errors.append(
+                "the two routes disagree: localStorage reads %s at %s MiB, "
+                "/rig/report reads %s at %s MiB"
+                % (ls_route.get("ended_by"), ls_route.get("survived_mib"),
+                   report_route.get("ended_by"), report_route.get("survived_mib")))
+    else:
+        notes.append("only the %s route answered"
+                     % ("localStorage" if ls_route else "/rig/report"))
+    if not lv["ok"]:
+        errors.append("ladder RED: %s" % lv["why"])
+    if page_lv.get("ok") is not None and bool(page_lv.get("ok")) != lv["ok"]:
+        notes.append("the page's own ladder verdict (%s) disagrees with the "
+                     "rig's recomputation (%s)" % (page_lv.get("ok"), lv["ok"]))
+    if expect_death_at is not None:
+        for name, route in (("localStorage", ls_route),
+                            ("/rig/report", report_route)):
+            if not route:
+                errors.append("expected a death at %d MiB on the %s route, and "
+                              "that route did not answer" % (expect_death_at, name))
+            elif (route.get("ended_by") != "death"
+                  or route.get("survived_mib") != expect_death_at):
+                errors.append("expected a death at %d MiB on the %s route; it "
+                              "reads %s at %s MiB"
+                              % (expect_death_at, name, route.get("ended_by"),
+                                 route.get("survived_mib")))
+    if out["doctored"]:
+        notes.append("DOCTORED run (doctor_ladder=%s): a control, never a wall "
+                     "reading" % ",".join(str(d) for d in out["doctored"]))
+    out["errors"], out["notes"] = errors, notes
+    out["ok"] = not errors
+    return out
+
+
+def calibrate_verdict_from_records(records, run="latest"):
+    """A calibrate run's verdict out of a report log ALONE -- the no-driver
+    arm, where nothing polled the page. The step records are the /rig/report
+    route; the readback record a later load of the run beacons carries what
+    localStorage held, and is the other route. `run` names the run, or
+    `latest` takes the last one the log holds. None when there is none."""
+    cal = [r.get("body") for r in records
+           if r.get("route") == "/rig/report" and isinstance(r.get("body"), dict)
+           and r["body"].get("kind") == "calibrate" and r["body"].get("run")]
+    if not cal:
+        return None
+    if run == "latest":
+        run = cal[-1]["run"]
+    readbacks = [b for b in cal if b.get("run") == run
+                 and b.get("phase") == "readback"
+                 and isinstance(b.get("readback"), dict)]
+    ls = calibrate_route_of_record(readbacks[-1]["readback"]) if readbacks else None
+    v = calibrate_verdict(ls, calibrate_report_route(records, run))
+    v["run"] = run
+    if not readbacks:
+        v["notes"].append("no readback record: the run was never loaded again "
+                          "after it ended, so the localStorage route is unread")
+    return v
+
+
+def calibrate_summary(tag, result):
+    v = result.get("calibrate") or {}
+    ls, rep = v.get("ls") or {}, v.get("report") or {}
+    lv = v.get("ladder_verdict") or {}
+    out = [
+        "[%s] CALIBRATE pass=%s ended_by=%s survived_mib=%s simulated=%s "
+        "deaths=%s coi=%s" % (tag, result.get("pass"), v.get("ended_by"),
+                              v.get("survived_mib"), v.get("simulated"),
+                              [d.get("kind") for d in result.get("deaths") or []],
+                              v.get("coi")),
+        "[%s] CALIBRATE ladder_ok=%s largest=%s MiB ask page=%s worker=%s "
+        "refused=%s doctored=%s" % (tag, v.get("ladder_ok"), lv.get("largest_mib"),
+                                    lv.get("page_ask_mib"), lv.get("worker_ask_mib"),
+                                    lv.get("refused_mib"), v.get("doctored")),
+        "[%s] CALIBRATE route localStorage: %s at %s MiB | route /rig/report: "
+        "%s at %s MiB over %s step records | agree=%s"
+        % (tag, ls.get("ended_by"), ls.get("survived_mib"), rep.get("ended_by"),
+           rep.get("survived_mib"), rep.get("steps"), v.get("routes_agree")),
+    ]
+    out += ["[%s] CALIBRATE error: %s" % (tag, e) for e in v.get("errors") or []]
+    out += ["[%s] CALIBRATE note: %s" % (tag, n) for n in v.get("notes") or []]
+    return "\n".join(out)
 
 
 class FrameLineWatcher:
@@ -10723,6 +11468,252 @@ def selftest_shell_cache():
     return failed
 
 
+def selftest_wall_rig():
+    """Executable pins on the M1 wall rig's readers: the one `wall_reading`
+    both routes go through, death detection in the sampler, the calibrate
+    page's two routes and its ladder verdict, `analyze-console`'s parse, and
+    the iOS capability shape. Each verdict is pinned on both arms. Returns the
+    number of failed pins."""
+    failed = 0
+
+    def pin(name, ok):
+        nonlocal failed
+        print("[self-test] %s %s" % ("ok  " if ok else "FAIL", name))
+        if not ok:
+            failed += 1
+
+    def budget(p, w, hp=1024, hw=1024):
+        return ("budget state: bracket desktop, rung 1, steps 0, pool 64 MiB, "
+                "ceiling 288 MiB, vram 0 MiB, ram 0 MiB, declared 0 MiB, "
+                "threads 8, form 2, linear %d/%d MiB, cap 288 0, probe 3, "
+                "balloon 0 MiB, page heap acts 0 at 0 MiB, heap max %d/%d MiB, "
+                "host steps 0 promotions 0 churn 0, admission asked 1 admitted "
+                "1 would refuse 0 refused 0, notices raised 0 live 0 reoffered "
+                "0, live %d/%d MiB" % (p, w, hp, hw, max(p - 9, 0), max(w - 9, 0)))
+
+    def census(inst, total, linear):
+        return ("heap census (%s): loop scans 100 B, loop archives 0 B, overlay "
+                "grids 5 B, upload pending 7 B, tile cache 11 B; resident total "
+                "%d B of %d B linear, residual 3 B" % (inst, total, linear))
+
+    # -- capabilities
+    desk = safari_capabilities()["capabilities"]["alwaysMatch"]
+    ios = safari_capabilities("64A825AA-AE5A-510E-88B0-E29F52F57C1D")[
+        "capabilities"]["alwaysMatch"]
+    pin("desktop safari caps are the browser name alone",
+        desk == {"browserName": "safari"})
+    pin("iOS safari caps name the platform and the device UDID",
+        ios.get("platformName") == "iOS"
+        and ios.get("safari:deviceUDID") == "64A825AA-AE5A-510E-88B0-E29F52F57C1D")
+    pin("neither safari arm asks for acceptInsecureCerts",
+        "acceptInsecureCerts" not in desk and "acceptInsecureCerts" not in ios)
+
+    # -- one pattern set, two evaluators
+    P = sample_probe_patterns()
+    pin("every SAMPLE_PROBE pattern is lifted into Python (>= 10)",
+        len(P) >= 10 and {"sample_linear_re", "sample_heap_max_re",
+                          "sample_census_loop_re"} <= set(P))
+    pin("each wall needle is an indexOf literal in WALL_LINES_PROBE",
+        all('indexOf("%s")' % n in WALL_LINES_PROBE for n in WALL_LINE_NEEDLES))
+    row, allocs = sample_row_from_lines([
+        {"t": 1, "msg": budget(300, 100)},
+        {"t": 2, "msg": census("page", 400, 500)},
+        {"t": 3, "msg": budget(310, 90, 512, 256)},
+        {"t": 4, "msg": "alloc failed: 9 B requested, 1 of 2 MiB linear in page"}])
+    pin("the Python row takes the LAST line of each family, as the page does",
+        row["linear_page_mib"] == 310 and row["linear_worker_mib"] == 90
+        and row["heap_max_page_mib"] == 512 and row["resident_total_b"] == 400
+        and row["census_linear_b"] == 500 and len(allocs) == 1)
+
+    # -- wall_reading
+    L = 1000
+    lines = [
+        {"t": 10, "msg": budget(600, 200), "load": L},
+        {"t": 12, "msg": census("page", 111, 900), "load": L},
+        {"t": 13, "msg": census("raster worker", 999, 999), "load": L},
+        {"t": 14, "msg": budget(900, 100), "load": L},
+        {"t": 15, "msg": "budget pressure: linear memory -> evicted", "load": L},
+    ]
+    w = wall_reading(lines, deaths=[])
+    pin("page and worker high-water are each their own peak",
+        w["page_hw_mib"] == 900 and w["worker_hw_mib"] == 200)
+    pin("the footprint is the highest pair on ONE tick, never peak plus peak",
+        w["sum_hw_mib"] == 1000)
+    pin("the census kept is the page's, not the worker's",
+        w["census_last_resident_b"] == 111)
+    pin("a pressure event is counted", w["budget_pressure_events"] == 1)
+    pin("no calibrate joined: no wall and no residue, and the row says why",
+        w["wall_mib"] is None and w["residue_mib"] is None and w["why_no_wall"])
+    cal = {"ended_by": "cap", "survived_mib": 4096, "ladder_largest_mib": 4096,
+           "ladder_ok": True, "doctored": []}
+    w = wall_reading(lines, deaths=[], calibrate=cal)
+    pin("residue is the wall minus the one-tick footprint",
+        w["wall_mib"] == 4096 and w["residue_mib"] == 3096)
+    w = wall_reading(lines, deaths=[], calibrate=dict(cal, doctored=[1024]))
+    pin("a doctored calibrate run is never a wall", w["wall_mib"] is None)
+    after = lines + [{"t": 3, "msg": budget(990, 300), "load": L + 5000},
+                     {"t": 4, "msg": census("page", 777, 900), "load": L + 5000}]
+    w = wall_reading(after, deaths=[{"kind": "reload"}])
+    pin("the reading window is the first load: the reloaded page's larger "
+        "figures and its census are not the wall",
+        w["page_hw_mib"] == 900 and w["census_last_resident_b"] == 111
+        and w["deaths"] == 1 and len(w["loads"]) == 2)
+    hook = lines + [{"t": 16, "msg": "alloc failed: 5 B requested, 1023 of 1024 "
+                                     "MiB linear in page", "load": L}]
+    w = wall_reading(hook, deaths=[])
+    pin("the allocation hook's page level raises the page high-water",
+        w["page_hw_mib"] == 1023 and w["page_hw_budget_state_mib"] == 900
+        and w["alloc_failures"] == 1)
+    w = wall_reading(lines, deaths=None)
+    pin("an unknowable death count is null, never zero", w["deaths"] is None)
+    pin("nothing booted reads unmeasured", not wall_reading([], [])["measured"])
+
+    # -- the two routes of the same lines
+    beacon = "\n".join(json.dumps({
+        "route": "/rig/console", "recv_utc": "2026-09-12T00:00:%02dZ" % i,
+        "client": "192.168.0.50",
+        "body": {"kind": "console", "t0": L, "load": "x", "ua": "Mozilla/5.0 "
+                 "(iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 "
+                 "(KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
+                 "coi": True, "lines": [{"t": e["t"], "lvl": "info",
+                                         "msg": e["msg"]}]}})
+        for i, e in enumerate(lines)) + "\n{torn"
+    got, meta = parse_console_text(beacon)
+    driven = wall_reading(lines, deaths=[])
+    analyzed = wall_reading(got, deaths=[{"kind": "reload", "load": ld}
+                                         for ld in meta["loads"][1:]])
+    pin("analyze-console reproduces a driven leg's wall columns from the same "
+        "lines", all(driven[k] == analyzed[k] for k in WALL_ROW_COLUMNS))
+    pin("the beaconed log names its format, its torn line and the browser",
+        meta["format"] == "jsonl" and meta["torn_lines"] == 1
+        and browser_from_ua(meta["ua"]) == "safari-ios" and meta["coi"] is True)
+    dump = "[Log] %s (squallar_web.js, line 1)\n12:00:01.5 [Warning] %s\n" % (
+        lines[0]["msg"], lines[3]["msg"])
+    got, meta = parse_console_text(dump)
+    w = wall_reading(got, deaths=None)
+    pin("a pasted console dump is stripped to the app's message",
+        meta["format"] == "text" and w["page_hw_mib"] == 900
+        and w["ticks"] == 2 and w["deaths"] is None)
+
+    # -- the sampler's death detection
+    class _Seq(object):
+        def __init__(self, replies):
+            self.replies = list(replies)
+
+        def execute(self, script, args=None, timeout=100.0):
+            r = self.replies.pop(0) if self.replies else {"row": {}}
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    s = CensusSampler(_Seq([{"row": {"t0": 1, "now": 10}},
+                            {"row": {"t0": 1, "now": 12}},
+                            {"row": {"t0": 2, "now": 3}}]), os.devnull, 2.0)
+    for k in range(3):
+        s.sample(k)
+    pin("a new document under the leg is ONE reload death, read from the row "
+        "before it", len(s.deaths) == 1 and s.deaths[0]["kind"] == "reload"
+        and (s.deaths[0]["last_row_before"] or {}).get("t_page_ms") == 12)
+    crash = WebDriverError("POST /execute/sync -> HTTP 500: unknown error: "
+                           "session deleted because of page crash")
+    s = CensusSampler(_Seq([{"row": {"t0": 1, "now": 10}}, crash, crash, crash,
+                            crash]), os.devnull, 2.0)
+    for k in range(5):
+        s.sample(k)
+    pin("a crashed page is one crash death however many probes fail after it",
+        [d["kind"] for d in s.deaths] == ["crash"])
+    busy = WebDriverError("POST /execute/sync -> HTTP 500: javascript error: x")
+    s = CensusSampler(_Seq([{"row": {"t0": 1, "now": 10}}, busy, busy, busy, busy,
+                            busy]), os.devnull, 2.0)
+    for k in range(6):
+        s.sample(k)
+    pin("a page answering nothing is one unresponsive death at the third miss",
+        [d["kind"] for d in s.deaths] == ["unresponsive"])
+    s = CensusSampler(_Seq([{"row": {"t0": 1, "now": 10}}, busy,
+                            {"row": {"t0": 1, "now": 14}}]), os.devnull, 2.0)
+    for k in range(3):
+        s.sample(k)
+    pin("one failed probe on a live page is not a death", s.deaths == [])
+    wl = {"lines": [{"t": 5, "msg": budget(1, 1)}], "t0": 1}
+    s = CensusSampler(_Seq([{"row": {"t0": 1, "now": 5}}, wl,
+                            {"row": {"t0": 1, "now": 7}}, wl]), os.devnull, 2.0,
+                      wall=True)
+    s.sample(0)
+    s.sample(1)
+    pin("wall lines are tagged with their document and kept once",
+        len(s.wall_line_list()) == 1 and s.wall_line_list()[0]["load"] == 1)
+    pin("the TSV's columns are unchanged by the wall rig",
+        "t0" not in CensusSampler.COLUMNS and len(CensusSampler.COLUMNS) == 28)
+    pin("page_death_kind reads a crash and not a script error",
+        page_death_kind(str(crash)) == "crash"
+        and page_death_kind(str(busy)) is None)
+
+    # -- the calibrate page's routes and verdict
+    ask = {"page_mib": 1024, "worker_mib": 1024}
+    ladder_ok = [{"mib": m, "ok": True} for m in (4096, 2048, 1024, 512, 256, 128)]
+    ladder_doctored = [dict(r, ok=r["mib"] not in (1024,)) for r in ladder_ok]
+
+    def step(seq, phase, survived, run="r1", **kw):
+        body = dict({"kind": "calibrate", "run": run, "seq": seq, "phase": phase,
+                     "survived_mib": survived, "ladder": ladder_ok, "ask": ask,
+                     "die_at_mib": None, "doctored": []}, **kw)
+        return {"route": "/rig/report", "body": body}
+
+    recs = ([step(i, "growing", 32 * i) for i in range(9)]
+            + [step(0, "growing", 999, run="other"),
+               {"route": "/rig/report", "body": {"kind": "calibrate", "run": "r1",
+                                                 "phase": "readback", "seq": 99}}])
+    rep = calibrate_report_route(recs, "r1")
+    pin("the report route reads a run whose last step is `growing` as a death "
+        "at that step", rep["ended_by"] == "death" and rep["survived_mib"] == 256
+        and rep["steps"] == 9)
+    rep_cap = calibrate_report_route(recs + [step(9, "ended", 4096, end="cap")],
+                                     "r1")
+    pin("an `ended` step is the end it names",
+        rep_cap["ended_by"] == "cap" and rep_cap["survived_mib"] == 4096)
+    pin("another run's records and a readback record are not steps",
+        calibrate_report_route(recs, "nope") is None)
+    ls = calibrate_route_of_record({"ended_by": "death", "survived_mib": 256,
+                                    "phase_at_end": "growing", "ladder": ladder_ok,
+                                    "ask": ask, "die_at_mib": 256, "doctored": []})
+    v = calibrate_verdict(ls, rep, expect_death_at=256)
+    pin("a death at N on both routes passes the die_at_mib control",
+        v["ok"] and v["routes_agree"] and ls["simulated"])
+    v = calibrate_verdict(dict(ls, survived_mib=288), rep, expect_death_at=256)
+    pin("routes that disagree fail and name both readings",
+        not v["ok"] and any("disagree" in e for e in v["errors"]))
+    v = calibrate_verdict(None, rep, expect_death_at=256)
+    pin("a death expected on both routes fails when one route is silent",
+        not v["ok"])
+    v = calibrate_verdict(None, calibrate_report_route(
+        [step(0, "ended", 4096, end="cap", ladder=ladder_doctored,
+              doctored=[1024], ladder_verdict={"ok": True})], "r1"))
+    pin("a refused rung this build asks for turns the verdict RED",
+        not v["ok"] and v["ladder_ok"] is False
+        and any("ladder RED" in e for e in v["errors"]))
+    pin("and the rig's recomputation, not the page's own boolean, decides",
+        any("disagrees with the rig" in n for n in v["notes"]))
+    v = calibrate_verdict(None, calibrate_report_route(
+        [step(0, "ended", 4096, end="cap")], "r1"))
+    pin("a whole ladder and a cap on one route passes, with the route noted",
+        v["ok"] and any("only the /rig/report route" in n for n in v["notes"]))
+    readback = {"route": "/rig/report", "body": {
+        "kind": "calibrate", "run": "r1", "phase": "readback", "readback": {
+            "ended_by": "death", "survived_mib": 256, "phase_at_end": "growing",
+            "ladder": ladder_ok, "ask": ask, "die_at_mib": None, "doctored": []}}}
+    v = calibrate_verdict_from_records(recs + [readback], "latest")
+    pin("a log alone yields both routes: steps for /rig/report, the readback "
+        "record for localStorage", v["ok"] and v["routes_agree"] is True
+        and v["ended_by"] == "death" and v["survived_mib"] == 256)
+    v = calibrate_verdict_from_records(recs, "r1")
+    pin("with no readback record the localStorage route is named unread",
+        any("no readback record" in n for n in v["notes"])
+        and v["routes_agree"] is None)
+    pin("a log with no calibrate run joins nothing",
+        calibrate_verdict_from_records([], "latest") is None)
+    return failed
+
+
 def selftest():
     failures = []
     if selftest_loop_or_refusal():
@@ -10755,6 +11746,9 @@ def selftest():
         failures.append("worst-frame window selector (see [self-test] lines)")
     if selftest_named_family_reaches_the_artifact():
         failures.append("named family -> written artifact (see [self-test] lines)")
+    if selftest_wall_rig():
+        failures.append("wall rig: calibrate / until-death / analyze-console "
+                        "(see [self-test] lines)")
     # 1. round-trip through every filter type (encoder shares _paeth with the
     #    decoder, so this catches asymmetric bugs, not a wrong shared paeth --
     #    decoding real browser/encoder PNGs below is the external check).
@@ -10873,6 +11867,7 @@ def run_smoke(args):
         print(line, flush=True)
 
     driver = session = None
+    sampler = None
     exit_code = 0
     try:
         if args.android and args.browser == "firefox":
@@ -10895,7 +11890,8 @@ def run_smoke(args):
             android_activity=args.android_activity,
             android_serial=args.adb_serial,
             android_use_running_app=args.android_use_running_app,
-            android_keep_app_data=not args.android_clear_app_data)
+            android_keep_app_data=not args.android_clear_app_data,
+            safari_ios_udid=getattr(args, "safari_ios", None))
         if args.android:
             # Before navigate, or 127.0.0.1 on the phone is the phone.
             port_ = urllib.parse.urlsplit(args.url).port
@@ -11123,7 +12119,8 @@ def run_smoke(args):
         sampler = None
         if args.sample_tsv:
             sampler = CensusSampler(session, args.sample_tsv,
-                                    args.sample_interval)
+                                    args.sample_interval,
+                                    wall=getattr(args, "until_death", False))
             sampler.note("drive.py run_id=%s tag=%s browser=%s started_utc=%s"
                          % (args.run_id, args.tag, args.browser,
                             result["started_utc"]))
@@ -11131,6 +12128,13 @@ def run_smoke(args):
                          % (args.canvas, args.window, args.sample_interval))
             stage("sampler", path=args.sample_tsv,
                   interval=args.sample_interval)
+
+        def died_check():
+            """`--until-death`: end the leg at the first death the sampler
+            saw. The death is the reading; see `finish_until_death_leg`."""
+            if (getattr(args, "until_death", False) and sampler is not None
+                    and sampler.deaths):
+                raise LegDied(sampler.deaths[0])
 
         def sample_sleep(seconds):
             """`time.sleep`, with a census row taken every interval on the way
@@ -11142,6 +12146,7 @@ def run_smoke(args):
             deadline = time.monotonic() + seconds
             while True:
                 sampler.sample(round(time.monotonic() - t0, 2))
+                died_check()
                 left = deadline - time.monotonic()
                 if left <= 0:
                     return
@@ -11233,9 +12238,11 @@ def run_smoke(args):
         # holes measured on 2026-09-08 contained the death.
         if sampler is not None:
             sampler.sample(round(time.monotonic() - t0, 2))
+            died_check()
         result["raf_warm"] = raf_sample(session, args.frames)
         if sampler is not None:
             sampler.sample(round(time.monotonic() - t0, 2))
+            died_check()
         stage("raf-warm-done", **{k: (round(v, 2) if isinstance(v, float) else v)
                                   for k, v in (result["raf_warm"] or {}).items()
                                   if k in ("ok", "n", "p50", "p95", "max")})
@@ -12091,6 +13098,38 @@ def run_smoke(args):
             "rayon_threads": (None if rp is None else rp.get("threads")),
         }
         exit_code = EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
+        if getattr(args, "until_death", False):
+            # NO death inside the window, and still a wall row: a desktop that
+            # survives the window is a reading, said plainly. The lines are the
+            # UNION of what the sampler took live and the end-of-leg export,
+            # keyed on (document, stamp, message), so the export's copy of a
+            # line the sampler already holds is one line.
+            wall_lines = sampler.wall_line_list() if sampler is not None else []
+            sig_ = result.get("rig_signal")
+            if isinstance(sig_, dict):
+                for fam in ("console", "console_tail", "errors",
+                            "instantiate_fallbacks"):
+                    for e_ in sig_.get(fam) or []:
+                        if is_wall_line((e_ or {}).get("msg")):
+                            wall_lines.append({
+                                "t": e_.get("t"), "msg": str(e_.get("msg")),
+                                "lvl": e_.get("lvl") or e_.get("kind"),
+                                "load": sig_.get("page_t0")})
+            result["wall"] = wall_reading(
+                wall_lines,
+                deaths=(sampler.deaths if sampler is not None else []),
+                calibrate=load_calibrate_json(getattr(args, "calibrate_json",
+                                                      None)))
+            # On an `--until-death` leg `pass` means "a wall reading was
+            # taken"; the ordinary smoke verdict stays on the row beside it.
+            result["smoke_pass"] = result["pass"]
+            result["pass"] = bool(result["wall"]["measured"])
+            result["verdict"]["until_death"] = {
+                "died": bool(result["wall"]["deaths"]),
+                "measured": result["wall"]["measured"],
+                "smoke_pass": result["smoke_pass"]}
+            stage("wall", **{k: result["wall"].get(k) for k in WALL_ROW_COLUMNS})
+            exit_code = EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
 
     except Exception as e:
         # A full disk is the BOX failing, not the app, and it is re-raised
@@ -12101,46 +13140,52 @@ def run_smoke(args):
         # does not exist.
         if isinstance(e, OSError) and e.errno in INFRA_ERRNOS:
             raise
-        result["failed_stage"] = (result["stages"][-1]["stage"]
-                                  if result["stages"] else "init")
-        result["exception"] = "".join(
-            traceback.format_exception_only(type(e), e)).strip()
-        result["traceback"] = traceback.format_exc()
-        result["pass"] = False
-        exit_code = 1 if not isinstance(e, WebDriverError) else 2
-        print("[%s] FAILED at stage %r: %s" % (tag, result["failed_stage"], e),
-              flush=True)
-        # best-effort diagnostics
-        if session is not None:
-            for key, script in (("boot_probe_at_failure", BOOT_PROBE),
-                                ("rig_signal_at_failure", RIG_ERRORS_PROBE)):
+        died = (until_death_event(e, sampler)
+                if getattr(args, "until_death", False) else None)
+        if died is not None:
+            exit_code = finish_until_death_leg(args, result, session, sampler,
+                                               died, stage)
+        else:
+            result["failed_stage"] = (result["stages"][-1]["stage"]
+                                      if result["stages"] else "init")
+            result["exception"] = "".join(
+                traceback.format_exception_only(type(e), e)).strip()
+            result["traceback"] = traceback.format_exc()
+            result["pass"] = False
+            exit_code = 1 if not isinstance(e, WebDriverError) else 2
+            print("[%s] FAILED at stage %r: %s" % (tag, result["failed_stage"], e),
+                  flush=True)
+            # best-effort diagnostics
+            if session is not None:
+                for key, script in (("boot_probe_at_failure", BOOT_PROBE),
+                                    ("rig_signal_at_failure", RIG_ERRORS_PROBE)):
+                    try:
+                        result[key] = session.execute(script, timeout=20)
+                    except Exception as diag:
+                        result[key] = "unavailable: %s" % diag
+                if isinstance(result.get("rig_signal_at_failure"), dict):
+                    _fw = console_window_record(result["rig_signal_at_failure"])
+                    if _fw is not None:
+                        result["rig_signal_at_failure"]["console_window"] = _fw
                 try:
-                    result[key] = session.execute(script, timeout=20)
-                except Exception as diag:
-                    result[key] = "unavailable: %s" % diag
-            if isinstance(result.get("rig_signal_at_failure"), dict):
-                _fw = console_window_record(result["rig_signal_at_failure"])
-                if _fw is not None:
-                    result["rig_signal_at_failure"]["console_window"] = _fw
-            try:
-                p = os.path.join(out_dir, "%s.fail.png" % tag)
-                save_screenshot(session.screenshot_b64(), p)
-                result["failure_screenshot"] = p
-            except Exception:
-                pass
-        if driver is not None:
-            result["driver_log_tail"] = driver.log_tail(80)
-            result["driver_log_tail_window"] = {
-                "entries_key": "driver_log_tail",
-                "source": "driver process log",
-                "lines_kept": len(
-                    (result["driver_log_tail"] or "").splitlines()),
-                "max_lines": 80,
-                "whole_log_path": getattr(driver, "log_path", None),
-                "covers": "the last 80 lines only; the WHOLE driver log is "
-                          "kept on disk at the path above, so an absence here "
-                          "is never an absence in the driver log",
-            }
+                    p = os.path.join(out_dir, "%s.fail.png" % tag)
+                    save_screenshot(session.screenshot_b64(), p)
+                    result["failure_screenshot"] = p
+                except Exception:
+                    pass
+            if driver is not None:
+                result["driver_log_tail"] = driver.log_tail(80)
+                result["driver_log_tail_window"] = {
+                    "entries_key": "driver_log_tail",
+                    "source": "driver process log",
+                    "lines_kept": len(
+                        (result["driver_log_tail"] or "").splitlines()),
+                    "max_lines": 80,
+                    "whole_log_path": getattr(driver, "log_path", None),
+                    "covers": "the last 80 lines only; the WHOLE driver log is "
+                              "kept on disk at the path above, so an absence here "
+                              "is never an absence in the driver log",
+                }
     finally:
         if session is not None:
             session.delete()
@@ -12160,6 +13205,8 @@ def run_smoke(args):
     with open(json_path, "w") as f:
         json.dump(result, f, indent=2, default=str)
     print("[%s] result -> %s" % (tag, json_path), flush=True)
+    if result.get("wall"):
+        print("[%s] WALL %s" % (tag, wall_row_text(result["wall"])), flush=True)
 
     # human summary
     v = result.get("verdict") or {}
@@ -12909,6 +13956,429 @@ def run_smoke(args):
     return exit_code
 
 
+def run_calibrate(args):
+    """`--calibrate`: drive `.github/browser-rig/calibrate.html` through ONE run
+    and read it back both ways.
+
+    The page does the work; this watches it. Polls `window.__calibrate` until
+    the run ENDS on a live page (refusal, cap), the page RELOADS (a death --
+    real on iOS, `die_at_mib` on a desktop), the driver says the page is GONE
+    (a crash), or `--calibrate-timeout` passes. Then the same URL is loaded
+    again, because the next load of a run is what reads its record back out of
+    localStorage; and with the browser gone, the run's step records are read
+    out of `--report-log`. The verdict (`calibrate_verdict`) holds the two
+    routes against each other and the ladder against this build's ask."""
+    t0 = time.monotonic()
+    out_dir = os.path.abspath(args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    tag = args.tag or "%s.calibrate" % args.browser
+    window = tuple(int(v) for v in args.window.split("x"))
+    run = (urllib.parse.parse_qs(urllib.parse.urlsplit(args.url).query)
+           .get("run") or [None])[0]
+    result = {"tag": tag, "mode": "calibrate", "browser": args.browser,
+              "url": args.url, "run_id": args.run_id, "calibrate_run": run,
+              "arm": args.arm, "invocation": sys.argv,
+              "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "stages": [], "gotchas": [], "deaths": [],
+              "host_loadavg": {"start": _loadavg(), "end": None}}
+
+    def stage(name, **detail):
+        entry = {"stage": name, "t": round(time.monotonic() - t0, 2)}
+        entry.update(detail)
+        result["stages"].append(entry)
+        line = "[%s] %6.2fs %s" % (tag, entry["t"], name)
+        if detail:
+            line += " " + json.dumps(detail, default=str)[:300]
+        print(line, flush=True)
+
+    def brief(st):
+        if not st:
+            return None
+        return {k: st.get(k) for k in ("load", "state", "survived_mib", "end",
+                                       "ask", "ladder", "ladder_verdict",
+                                       "beacons", "verdict_text", "params")}
+
+    android = getattr(args, "android", False)
+    driver = session = None
+    last = None
+    ls_readback = None
+    try:
+        stage("launch-driver")
+        driver, session, info = launch(
+            args.browser, out_dir, tag, driver_path=args.driver,
+            binary=args.binary, window=window, headless=not args.headed,
+            tmp_root=args.tmp_dir,
+            ff_prefs=parse_kv(args.ff_pref, json_values=True),
+            extra_env=parse_kv(args.env), ff_mode=args.ff_mode, arm=args.arm,
+            display=args.display, chromium_args=args.chromium_arg,
+            android=android, android_package=args.android_package,
+            android_activity=args.android_activity,
+            android_serial=args.adb_serial,
+            android_use_running_app=args.android_use_running_app,
+            android_keep_app_data=not args.android_clear_app_data,
+            safari_ios_udid=args.safari_ios)
+        if android:
+            port_ = urllib.parse.urlsplit(args.url).port or (
+                443 if args.url.startswith("https") else 80)
+            stage("adb-reverse", port=port_)
+            result["adb_reverse"] = adb_reverse(port_, args.adb_serial)
+        result["binary"] = info
+        caps = session.caps
+        result["session"] = {"browserName": caps.get("browserName"),
+                             "browserVersion": caps.get("browserVersion"),
+                             "platformName": caps.get("platformName")}
+        stage("session-created", browser=caps.get("browserName"),
+              version=caps.get("browserVersion"))
+        session.set_timeouts(script_ms=args.script_timeout * 1000,
+                             page_ms=args.page_timeout * 1000)
+        if not android and not args.safari_ios:
+            try:
+                session.set_window_rect(*window)
+            except WebDriverError as e:
+                result["gotchas"].append("set_window_rect failed: %s" % e)
+        stage("navigate", url=args.url)
+        session.navigate(args.url, timeout=args.page_timeout + 30)
+        first_load = None
+        misses = 0
+        deadline = time.monotonic() + args.calibrate_timeout
+        while True:
+            try:
+                st = session.execute(CALIBRATE_PROBE, timeout=60)
+                misses = 0
+            except WebDriverError as e:
+                misses += 1
+                kind = page_death_kind(str(e))
+                if kind or misses >= UNRESPONSIVE_PROBES:
+                    result["deaths"].append({"kind": kind or "unresponsive",
+                                             "error": str(e)[:300],
+                                             "last_state": brief(last)})
+                    stage("calibrate-death", kind=kind or "unresponsive",
+                          survived_mib=(last or {}).get("survived_mib"))
+                    break
+                time.sleep(args.calibrate_poll)
+                continue
+            if st and st.get("load"):
+                if first_load is None:
+                    first_load = st["load"]
+                    stage("calibrate-page", state=st.get("state"),
+                          load=first_load)
+                if st["load"] != first_load:
+                    if not result["deaths"]:
+                        result["deaths"].append({"kind": "reload",
+                                                 "last_state": brief(last)})
+                        stage("calibrate-reload",
+                              survived_mib=(last or {}).get("survived_mib"))
+                    if st.get("state") == "readback":
+                        ls_readback = st.get("readback")
+                        break
+                else:
+                    state = st.get("state")
+                    if state == "readback":
+                        ls_readback = st.get("readback")
+                        result["gotchas"].append(
+                            "run %r was already stored on this origin: this leg "
+                            "read an earlier run back and grew nothing" % run)
+                        break
+                    if state == "idle":
+                        raise WebDriverError(
+                            "the calibrate page is idle: the URL carries no run=")
+                    last = st
+                    if state == "ended":
+                        stage("calibrate-ended", end=st.get("end"),
+                              survived_mib=st.get("survived_mib"))
+                        break
+            if time.monotonic() > deadline:
+                result["timed_out"] = True
+                stage("calibrate-TIMEOUT", seconds=args.calibrate_timeout,
+                      state=(last or {}).get("state"),
+                      survived_mib=(last or {}).get("survived_mib"))
+                break
+            time.sleep(args.calibrate_poll)
+        result["calibrate_page"] = brief(last)
+        if ls_readback is None and not result.get("timed_out"):
+            try:
+                stage("readback-navigate")
+                session.navigate(args.url, timeout=args.page_timeout + 30)
+                t_rb = time.monotonic()
+                while time.monotonic() - t_rb < 60:
+                    try:
+                        st = session.execute(CALIBRATE_PROBE, timeout=30)
+                    except WebDriverError:
+                        st = None
+                    if st and st.get("state") == "readback":
+                        ls_readback = st.get("readback")
+                        break
+                    if st and st.get("state") in ("ladder", "growing"):
+                        result["gotchas"].append(
+                            "the readback load started a FRESH run: "
+                            "localStorage did not hold run %r" % run)
+                        break
+                    time.sleep(0.5)
+            except WebDriverError as e:
+                result["readback_error"] = str(e)[:300]
+        stage("readback", ended_by=(ls_readback or {}).get("ended_by"),
+              survived_mib=(ls_readback or {}).get("survived_mib"))
+    except Exception as e:
+        if isinstance(e, OSError) and e.errno in INFRA_ERRNOS:
+            raise
+        result["failed_stage"] = (result["stages"][-1]["stage"]
+                                  if result["stages"] else "init")
+        result["exception"] = "".join(
+            traceback.format_exception_only(type(e), e)).strip()
+        result["traceback"] = traceback.format_exc()
+        print("[%s] FAILED at stage %r: %s" % (tag, result["failed_stage"], e),
+              flush=True)
+        if driver is not None:
+            result["driver_log_tail"] = driver.log_tail(80)
+    finally:
+        if session is not None:
+            session.delete()
+        if driver is not None:
+            driver.stop()
+        if android:
+            result["adb_reverse_removed"] = adb_reverse_cleanup()
+
+    report = None
+    if args.report_log:
+        # A beacon still in flight when the browser went away gets its moment.
+        time.sleep(1.0)
+        if os.path.isfile(args.report_log):
+            recs, torn = read_report_log(args.report_log)
+            report = calibrate_report_route(recs, run)
+            result["report_log"] = {"path": os.path.abspath(args.report_log),
+                                    "records": len(recs), "torn_lines": torn}
+        else:
+            result["report_log"] = {"path": os.path.abspath(args.report_log),
+                                    "error": "no such file"}
+    verdict = calibrate_verdict(
+        calibrate_route_of_record(ls_readback) if ls_readback else None,
+        report, args.expect_calibrate_death_at)
+    if result.get("timed_out"):
+        verdict["errors"].append(
+            "the run had not ended when the leg stopped (%.0f s): a run with no "
+            "end is not a reading, and both routes would call it a death"
+            % args.calibrate_timeout)
+    if result.get("exception"):
+        verdict["errors"].append("the leg failed at stage %r: %s"
+                                 % (result.get("failed_stage"),
+                                    result.get("exception")))
+    verdict["ok"] = not verdict["errors"]
+    result["calibrate"] = verdict
+    result["pass"] = bool(verdict["ok"])
+    result["total_s"] = round(time.monotonic() - t0, 2)
+    result["host_loadavg"]["end"] = _loadavg()
+    json_path = os.path.join(out_dir, "%s.json" % tag)
+    with open(json_path, "w") as fh:
+        json.dump(result, fh, indent=2, default=str)
+    print("[%s] calibrate artifact -> %s" % (tag, json_path), flush=True)
+    print(calibrate_summary(tag, result), flush=True)
+    return EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
+
+
+_DUMP_TIME_RE = re.compile(
+    r"^\s*(?:\d{4}-\d{2}-\d{2}[T ])?\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?Z?\s+")
+_DUMP_LEVEL_RE = re.compile(r"^\s*\[(?:Log|Info|Debug|Warning|Warn|Error)\]\s*",
+                            re.I)
+_DUMP_SOURCE_RE = re.compile(r"\s*\([^()]*,\s*line \d+\)\s*$")
+
+
+def console_dump_message(raw):
+    """One line of a pasted console -- Safari Web Inspector's export, a copy
+    out of any devtools -- as the message the app wrote, or None."""
+    s = _DUMP_TIME_RE.sub("", raw or "", count=1)
+    s = _DUMP_LEVEL_RE.sub("", s, count=1)
+    s = _DUMP_SOURCE_RE.sub("", s)
+    return s.strip() or None
+
+
+def browser_from_ua(ua):
+    """The browser a user agent names, in the rig's spelling. On iOS every
+    browser is WebKit, and the name says so."""
+    u = str(ua or "")
+    if not u:
+        return None
+    if "FxiOS" in u:
+        return "firefox-ios-webkit"
+    if "CriOS" in u:
+        return "chrome-ios-webkit"
+    if "Firefox/" in u:
+        return "firefox-android" if "Android" in u else "firefox"
+    if "Chrome/" in u or "Chromium/" in u:
+        return "chromium-android" if "Android" in u else "chromium"
+    if "Safari/" in u:
+        return "safari-ios" if ("iPhone" in u or "iPad" in u) else "safari"
+    return None
+
+
+def parse_console_text(text):
+    """A beaconed log (serve.py --report-log JSONL) or a plain console dump ->
+    `(lines, meta)`, lines shaped for `wall_reading`: `{t, msg, lvl, load}`."""
+    first = next((ln for ln in (text or "").splitlines() if ln.strip()), "")
+    try:
+        head = json.loads(first)
+        jsonl = isinstance(head, dict) and "route" in head
+    except ValueError:
+        jsonl = False
+    meta = {"format": "jsonl" if jsonl else "text", "records": 0, "loads": [],
+            "torn_lines": 0, "ua": None, "coi": None, "standalone": None,
+            "href": None, "first_recv_utc": None, "last_recv_utc": None,
+            "clients": []}
+    lines = []
+    if jsonl:
+        recs, meta["torn_lines"] = report_records_from_text(text)
+        for r in recs:
+            body = r.get("body")
+            if r.get("route") != "/rig/console" or not isinstance(body, dict):
+                continue
+            meta["records"] += 1
+            load = body.get("t0") if body.get("t0") is not None else body.get("load")
+            if load not in meta["loads"]:
+                meta["loads"].append(load)
+            for k in ("ua", "coi", "standalone", "href"):
+                if body.get(k) is not None:
+                    meta[k] = body.get(k)
+            if r.get("client") and r["client"] not in meta["clients"]:
+                meta["clients"].append(r["client"])
+            meta["first_recv_utc"] = meta["first_recv_utc"] or r.get("recv_utc")
+            meta["last_recv_utc"] = r.get("recv_utc")
+            for e in body.get("lines") or []:
+                lines.append({"t": e.get("t"), "msg": str(e.get("msg") or ""),
+                              "lvl": e.get("lvl"), "load": load,
+                              "recv_utc": r.get("recv_utc")})
+    else:
+        for i, raw in enumerate((text or "").splitlines()):
+            msg = console_dump_message(raw)
+            if msg:
+                lines.append({"t": None, "msg": msg, "lvl": None, "load": None,
+                              "order": i})
+    return lines, meta
+
+
+def write_console_samples(path, lines, meta):
+    """`<tag>.samples.tsv` out of a log: one `CensusSampler.COLUMNS` row per
+    `budget state:` tick, `SAMPLE_PROBE`'s reading computed over that load's
+    lines so far. Returns the row count."""
+    P = sample_probe_patterns()
+    ordered = sorted(lines, key=lambda e: (
+        e.get("load") is None, e.get("load") or 0,
+        e.get("t") if e.get("t") is not None else 0, e.get("order") or 0))
+    t_first = next((e["t"] for e in ordered if e.get("t") is not None), None)
+    none = object()
+    load, seen, allocs, deaths, n = none, [], set(), 0, 0
+    with open(path, "w") as fh:
+        fh.write("# drive.py analyze-console format=%s records=%s loads=%d "
+                 "lines=%d\n" % (meta.get("format"), meta.get("records"),
+                                 len(meta.get("loads") or []), len(lines)))
+        fh.write("# clocks: t_host_iso is the SERVER's receive time of the "
+                 "batch that carried the tick ('-' for a text dump); t_page_ms "
+                 "is the page's Date.now(); leg_s counts from the log's first "
+                 "line on the page clock. loadavg1 is '-': the host that ran "
+                 "the page is not this one.\n")
+        fh.write("#columns\t%s\n" % "\t".join(CensusSampler.COLUMNS))
+        for e in ordered:
+            if e.get("load") != load:
+                if load is not none:
+                    deaths += 1
+                    fh.write("# death %d: page reload (page t0 %s -> %s)\n"
+                             % (deaths, load, e.get("load")))
+                load, seen = e.get("load"), []
+            seen.append(e)
+            m = str(e.get("msg") or "")
+            if "alloc failed:" in m:
+                allocs.add((load, e.get("t"), m))
+            if not P["sample_linear_re"].search(m):
+                continue
+            r, _ = sample_row_from_lines(seen, P)
+            r["now"] = e.get("t")
+            leg_s = (round((e["t"] - t_first) / 1000.0, 2)
+                     if e.get("t") is not None and t_first is not None else None)
+            row = census_row(r, e.get("recv_utc"), leg_s, None, len(allocs))
+            fh.write("\t".join("-" if row[c] is None else str(row[c])
+                               for c in CensusSampler.COLUMNS) + "\n")
+            n += 1
+    return n
+
+
+def cmd_analyze_console(argv):
+    """`drive.py analyze-console --log <jsonl|dump> --tag T --out D`.
+
+    The offline half of a leg nobody drives. A home-screen web app on a phone
+    has no WebDriver; with `serve.py --console-beacon --report-log` its memory
+    lines reach this box anyway, and this turns that log into the `<tag>.json`
+    and `<tag>.samples.tsv` a driven `--until-death` leg writes: the same
+    `wall` block through the same `wall_reading`, and the same TSV columns
+    through the same `census_row`."""
+    ap = LoudArgumentParser(
+        prog="drive.py analyze-console",
+        description="turn a beaconed console log (or a pasted console dump) "
+                    "into the wall row a driven leg writes")
+    ap.add_argument("--log", required=True,
+                    help="serve.py --report-log JSONL, or a plain console dump")
+    ap.add_argument("--tag", required=True, help="output file prefix")
+    ap.add_argument("--out", required=True, help="output directory")
+    ap.add_argument("--calibrate-json", default=None, metavar="PATH",
+                    help="a calibrate leg's <tag>.json, joined for wall_mib and "
+                         "residue_mib")
+    ap.add_argument("--browser", default=None,
+                    help="name the browser (default: read off the user agent)")
+    ap.add_argument("--calibrate-run", default=None, metavar="RUN|latest",
+                    help="read a calibrate run's verdict out of a report log "
+                         "(--calibrate-log, default --log) instead of a driven "
+                         "leg's json: its step records are one route, the "
+                         "readback record a later load beacons is the other")
+    ap.add_argument("--calibrate-log", default=None, metavar="PATH",
+                    help="the report log holding --calibrate-run's records "
+                         "(default: --log)")
+    args = ap.parse_args(argv)
+    if args.calibrate_run and args.calibrate_json:
+        ap.error("--calibrate-json and --calibrate-run are two sources for one "
+                 "join; pass one")
+    if args.calibrate_log and not args.calibrate_run:
+        ap.error("--calibrate-log is only read with --calibrate-run")
+    with open(args.log, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    lines, meta = parse_console_text(text)
+    calibrate = load_calibrate_json(args.calibrate_json)
+    if args.calibrate_run:
+        if args.calibrate_log:
+            with open(args.calibrate_log, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        calibrate = calibrate_verdict_from_records(
+            report_records_from_text(text)[0], args.calibrate_run)
+    deaths = ([{"kind": "reload", "load": ld} for ld in meta["loads"][1:]]
+              if meta["format"] == "jsonl" else None)
+    wall = wall_reading(lines, deaths=deaths, calibrate=calibrate)
+    os.makedirs(args.out, exist_ok=True)
+    tsv = os.path.join(args.out, "%s.samples.tsv" % args.tag)
+    rows = write_console_samples(tsv, lines, meta)
+    result = {
+        "tag": args.tag, "mode": "analyze-console",
+        "source_log": os.path.abspath(args.log), "log_format": meta["format"],
+        "records": meta["records"], "torn_lines": meta["torn_lines"],
+        "loads": meta["loads"], "clients": meta["clients"],
+        "browser": args.browser or browser_from_ua(meta["ua"]),
+        "ua": meta["ua"], "cross_origin_isolated": meta["coi"],
+        "standalone": meta["standalone"], "href": meta["href"],
+        "first_recv_utc": meta["first_recv_utc"],
+        "last_recv_utc": meta["last_recv_utc"], "lines": len(lines),
+        "census_samples": {"path": tsv, "rows": rows,
+                           "interval_s": "one row per budget-state tick"},
+        "calibrate_json": args.calibrate_json,
+        "calibrate_run": args.calibrate_run,
+        "calibrate": calibrate,
+        "wall": wall, "pass": bool(wall["measured"]),
+        "analyzed_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    json_path = os.path.join(args.out, "%s.json" % args.tag)
+    with open(json_path, "w") as fh:
+        json.dump(result, fh, indent=2, default=str)
+    print("[%s] analyze-console %s log, %d records, %d loads, %d lines -> %s"
+          % (args.tag, meta["format"], meta["records"], len(meta["loads"]),
+             len(lines), json_path), flush=True)
+    print("[%s] WALL %s" % (args.tag, wall_row_text(wall)), flush=True)
+    return EXIT_PASS if result["pass"] else EXIT_LEG_FAILED
+
+
 class LoudArgumentParser(argparse.ArgumentParser):
     """An argument parser whose refusal is impossible to scroll past.
 
@@ -13255,6 +14725,9 @@ def selftest_worst_frame_window(window_stats=None):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "analyze-console":
+        return cmd_analyze_console(argv[1:])
     ap = LoudArgumentParser(
         description="headless WebDriver smoke/measurement rig for squallar-web")
     ap.add_argument("--browser", choices=("chromium", "firefox", "safari"))
@@ -13659,6 +15132,38 @@ def main(argv=None):
     ap.add_argument("--env", action="append", default=[],
                     help="extra env var for the driver+browser process, "
                          "K=V; repeatable")
+    ap.add_argument("--safari-ios", default=None, metavar="UDID",
+                    help="with --browser safari: drive Safari ON THE iOS DEVICE "
+                         "with this UDID (safaridriver on a Mac, device over "
+                         "USB). See .claude/skills/iphone-safari-rig")
+    ap.add_argument("--until-death", action="store_true",
+                    help="a WALL leg (needs --sample-tsv): a page reload or a "
+                         "crashed page under the leg is the READING, not a "
+                         "failure. The leg ends at the first death, keeps the "
+                         "last sample before it, and writes a `wall` block "
+                         "(page and worker linear high-water, ceilings, the "
+                         "census at the last tick, deaths, residue); `pass` is "
+                         "then 'a wall reading was taken', with the ordinary "
+                         "verdict kept as `smoke_pass`")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="drive calibrate.html (serve.py /rig/calibrate.html, "
+                         "URL carrying run=<id>) through one run and read it "
+                         "back through localStorage AND --report-log")
+    ap.add_argument("--report-log", default=None, metavar="PATH",
+                    help="the serve.py --report-log file a --calibrate leg "
+                         "reads its /rig/report step records from")
+    ap.add_argument("--calibrate-json", default=None, metavar="PATH",
+                    help="join a calibrate leg's <tag>.json into this leg's "
+                         "wall row (wall_mib, ladder, residue_mib)")
+    ap.add_argument("--calibrate-timeout", type=float, default=900.0,
+                    help="seconds a --calibrate run may take before the leg "
+                         "stops and says it had no end (default 900)")
+    ap.add_argument("--calibrate-poll", type=float, default=1.0,
+                    help="seconds between window.__calibrate polls")
+    ap.add_argument("--expect-calibrate-death-at", type=int, default=None,
+                    metavar="MIB",
+                    help="the die_at_mib control: fail unless BOTH routes read "
+                         "a death with exactly MIB survived")
     ap.add_argument("--selftest", action="store_true",
                     help="run the PNG decoder/blank-detector selftest and exit")
     args = ap.parse_args(argv)
@@ -13686,6 +15191,22 @@ def main(argv=None):
         ap.error("--adb-serial is only meaningful with --android")
     if args.android_activity and not args.android:
         ap.error("--android-activity is only meaningful with --android")
+    if args.safari_ios and args.browser != "safari":
+        ap.error("--safari-ios drives Safari on an iOS device; it needs "
+                 "--browser safari")
+    if args.expect_calibrate_death_at is not None and not args.calibrate:
+        ap.error("--expect-calibrate-death-at is only meaningful with --calibrate")
+    if args.calibrate:
+        if args.until_death:
+            ap.error("--calibrate and --until-death are two different legs")
+        if not (urllib.parse.parse_qs(urllib.parse.urlsplit(args.url).query)
+                .get("run")):
+            ap.error("--calibrate needs a URL carrying run=<id>: without one "
+                     "the page runs nothing and waits for a human")
+        return run_calibrate(args)
+    if args.until_death and not args.sample_tsv:
+        ap.error("--until-death needs --sample-tsv: the reading IS the last "
+                 "sample before the death, and without a sampler there is none")
     return run_smoke(args)
 
 
