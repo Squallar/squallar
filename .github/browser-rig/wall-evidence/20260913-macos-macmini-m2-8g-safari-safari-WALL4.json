@@ -1,0 +1,565 @@
+{
+  "alloc_instances": [],
+  "app_build": "b92a784f7",
+  "arm": "hardware",
+  "beaconed_route_agrees": false,
+  "beaconed_route_differs": [
+    "ticks"
+  ],
+  "browser": "safari",
+  "browser_version": "26.4",
+  "calibrate": {
+    "ask": {
+      "error": null,
+      "form": "desktop",
+      "page_mib": 1024,
+      "signals": {
+        "anyPointerFine": true,
+        "deviceMemoryBytes": null,
+        "maxTouchPoints": 0,
+        "pointerCoarse": false
+      },
+      "worker_mib": 1024
+    },
+    "doctored": [],
+    "ended_by": "cap",
+    "ladder_largest_mib": 4096,
+    "ladder_ok": true,
+    "ok": true,
+    "routes_agree": true,
+    "simulated": false,
+    "survived_mib": 4096
+  },
+  "calibrate_join_rule": "the joined run (`calibrate`, `wall_mib`) is the one with the LOWEST survived MiB among runs that ended by death, refusal or cap and were not doctored",
+  "calibrate_runs": [
+    {
+      "ask": {
+        "error": null,
+        "form": "desktop",
+        "page_mib": 1024,
+        "signals": {
+          "anyPointerFine": true,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 0,
+          "pointerCoarse": false
+        },
+        "worker_mib": 1024
+      },
+      "browser_version": "26.4",
+      "coi": true,
+      "deaths": [],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 1,
+        "hardware_concurrency": 8,
+        "max_touch_points": 0,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "MacIntel",
+        "recorded_by": "the page's own calibrate record, load mtz68dth-erlaaiyu, received 2026-09-13T02:04:42Z",
+        "screen_avail_height": 1410,
+        "screen_avail_width": 3440,
+        "screen_height": 1440,
+        "screen_width": 3440,
+        "standalone": false,
+        "ua_os_version": null,
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+      },
+      "ended_by": "cap",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/cal1/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [],
+      "ok": true,
+      "route_localstorage": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "survived_mib": 4096
+      },
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "steps": 135,
+        "survived_mib": 4096
+      },
+      "routes_agree": true,
+      "run": "wall-20260913T020441Z-1399168-4535",
+      "survived_mib": 4096,
+      "total_s": 42.15
+    },
+    {
+      "ask": {
+        "error": null,
+        "form": "desktop",
+        "page_mib": 1024,
+        "signals": {
+          "anyPointerFine": true,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 0,
+          "pointerCoarse": false
+        },
+        "worker_mib": 1024
+      },
+      "browser_version": "26.4",
+      "coi": true,
+      "deaths": [],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 1,
+        "hardware_concurrency": 8,
+        "max_touch_points": 0,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "MacIntel",
+        "recorded_by": "the page's own calibrate record, load mtz6az2a-h35jvmkz, received 2026-09-13T02:06:43Z",
+        "screen_avail_height": 1410,
+        "screen_avail_width": 3440,
+        "screen_height": 1440,
+        "screen_width": 3440,
+        "standalone": false,
+        "ua_os_version": null,
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+      },
+      "ended_by": "cap",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/cal2/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [],
+      "ok": true,
+      "route_localstorage": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "survived_mib": 4096
+      },
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "steps": 135,
+        "survived_mib": 4096
+      },
+      "routes_agree": true,
+      "run": "wall-20260913T020642Z-1435544-2800",
+      "survived_mib": 4096,
+      "total_s": 43.19
+    },
+    {
+      "ask": {
+        "error": null,
+        "form": "desktop",
+        "page_mib": 1024,
+        "signals": {
+          "anyPointerFine": true,
+          "deviceMemoryBytes": null,
+          "maxTouchPoints": 0,
+          "pointerCoarse": false
+        },
+        "worker_mib": 1024
+      },
+      "browser_version": "26.4",
+      "coi": true,
+      "deaths": [],
+      "device_signals": {
+        "device_memory": null,
+        "device_memory_present": false,
+        "device_pixel_ratio": 1,
+        "hardware_concurrency": 8,
+        "max_touch_points": 0,
+        "measure_user_agent_specific_memory_present": false,
+        "platform": "MacIntel",
+        "recorded_by": "the page's own calibrate record, load mtz6don0-6vnu35w6, received 2026-09-13T02:08:50Z",
+        "screen_avail_height": 1410,
+        "screen_avail_width": 3440,
+        "screen_height": 1440,
+        "screen_width": 3440,
+        "standalone": false,
+        "ua_os_version": null,
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+      },
+      "ended_by": "cap",
+      "errors": [],
+      "json": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/cal3/safari.calibrate.json",
+      "ladder": [
+        {
+          "error": null,
+          "mib": 4096,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 2048,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 1024,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 512,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 256,
+          "ok": true
+        },
+        {
+          "error": null,
+          "mib": 128,
+          "ok": true
+        }
+      ],
+      "ladder_largest_mib": 4096,
+      "ladder_ok": true,
+      "notes": [],
+      "ok": true,
+      "route_localstorage": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "survived_mib": 4096
+      },
+      "route_report": {
+        "at_maximum": null,
+        "attempting_mib": 4128,
+        "attempting_rung_mib": null,
+        "ended_by": "cap",
+        "error": null,
+        "memory_maximum_mib": 4096,
+        "phase_at_end": "ended",
+        "steps": 135,
+        "survived_mib": 4096
+      },
+      "routes_agree": true,
+      "run": "wall-20260913T020848Z-1442913-8057",
+      "survived_mib": 4096,
+      "total_s": 42.9
+    }
+  ],
+  "ceiling_page_mib": 1024,
+  "ceiling_worker_mib": 1024,
+  "commit": "7e4e5883600b",
+  "confounders": [
+    "GEOLOCATION PROMPT (stated confounder, prompt state not observed). squallar-location's gate asks at startup on a fresh origin (LocationMemo default enabled=true, attempts=0; permission Prompt -> request_location -> watchPosition), and each automation session starts on empty website data, so Safari was asked for location on this leg. Nobody was at the Mac to see or answer a prompt. `leg_liveness` shows it stalled nothing. A `squallar.location` = {\"attempts\":2,\"enabled\":true} seed avoids it; not used.",
+    "Before any Mac leg, a 12-day-old Safari `--automation` process (pid 5711) made every session time out pairing; it was killed and safaridriver launched a fresh automation Safari.",
+    "Served from the Linux box through an ssh reverse tunnel at http://127.0.0.1:<port> on the Mac (a secure context, so COOP/COEP give cross-origin isolation with no certificate on the Mac). The app bundle and the beacons crossed the tunnel; the app's data fetches went from the Mac to the internet directly.",
+    "WALL is a FLOOR: every calibrate run reached the 4 GiB policy cap (4096 MiB touched and alive), and one wasm32 memory cannot exceed 4 GiB, so this Mac's kill point was not reached.",
+    "Display: KVM on the Mac, real 3440x1440 panel (devicePixelRatio 1); a 1920x1080 display was also online. App backend BrowserWebGpu.",
+    "Served build: app b92a784f7 (wasm sha256 in provenance); rig at the `commit` column.",
+    "Driven 75 ticks against 77 beaconed (ring turnover); every other column agrees."
+  ],
+  "cross_origin_isolated": true,
+  "date": "2026-09-13",
+  "death_kinds": [],
+  "device_class": "macos-macmini-m2-8g-safari",
+  "device_reported": {
+    "cpu": "Apple M2",
+    "display_note": "KVM on the Mac: main display is the real 3440x1440 panel; a 1920x1080 display is also online",
+    "displays_raw": "Resolution: 3440 x 1440 (UWQHD - Ultra-Wide Quad HD); Main Display: Yes; Online: Yes; Resolution: 1920 x 1080 (1080p FHD - Full High Definition); Online: Yes;",
+    "hw_model": "Mac14,3",
+    "logical_cpus": 8,
+    "memory_bytes": 8589934592,
+    "os_build": "25E253",
+    "os_version": "26.4.1",
+    "safari_version": "26.4",
+    "source": "sw_vers, sysctl, Safari Info.plist and system_profiler SPDisplaysDataType on the Mac mini over ssh (read-only), 2026-09-12"
+  },
+  "device_signals": {
+    "device_memory": null,
+    "device_memory_present": false,
+    "device_pixel_ratio": 1,
+    "hardware_concurrency": 8,
+    "max_touch_points": 0,
+    "measure_user_agent_specific_memory_present": false,
+    "platform": "MacIntel",
+    "recorded_by": "the page's own console record, load mtz6jixc-hh41dtp2, received 2026-09-13T02:13:22Z",
+    "screen_avail_height": 1410,
+    "screen_avail_width": 3440,
+    "screen_height": 1440,
+    "screen_width": 3440,
+    "standalone": false,
+    "ua_os_version": null,
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.4 Safari/605.1.15"
+  },
+  "first_alloc_failure": null,
+  "job_costs": {
+    "basemap/tiles off the frame": {
+      "max_ms": 361,
+      "median_ms": 13,
+      "min_ms": 2,
+      "n": 16,
+      "p90_ms": 356,
+      "sum_ms": 1562
+    },
+    "decode off the frame": {
+      "max_ms": 8777,
+      "median_ms": 6665,
+      "min_ms": 100,
+      "n": 20,
+      "p90_ms": 8601,
+      "sum_ms": 82937
+    },
+    "overlay/alerts off the frame": {
+      "max_ms": 8663,
+      "median_ms": 4976,
+      "min_ms": 2714,
+      "n": 5,
+      "p90_ms": 8663,
+      "sum_ms": 26616
+    },
+    "overlay/coverage off the frame": {
+      "max_ms": 7464,
+      "median_ms": 53,
+      "min_ms": 0,
+      "n": 1546,
+      "p90_ms": 100,
+      "sum_ms": 175319
+    },
+    "overlay/discussions off the frame": {
+      "max_ms": 415,
+      "median_ms": 46,
+      "min_ms": 1,
+      "n": 465,
+      "p90_ms": 86,
+      "sum_ms": 23914
+    },
+    "overlay/glm off the frame": {
+      "max_ms": 10565,
+      "median_ms": 25,
+      "min_ms": 2,
+      "n": 416,
+      "p90_ms": 100,
+      "sum_ms": 77781
+    },
+    "overlay/metar off the frame": {
+      "max_ms": 9978,
+      "median_ms": 52,
+      "min_ms": 1,
+      "n": 1551,
+      "p90_ms": 101,
+      "sum_ms": 174202
+    },
+    "overlay/model off the frame": {
+      "max_ms": 10567,
+      "median_ms": 49,
+      "min_ms": 0,
+      "n": 4749,
+      "p90_ms": 99,
+      "sum_ms": 801596
+    },
+    "overlay/reports off the frame": {
+      "max_ms": 6651,
+      "median_ms": 6641,
+      "min_ms": 17,
+      "n": 8,
+      "p90_ms": 6651,
+      "sum_ms": 26670
+    },
+    "radar off the frame": {
+      "max_ms": 8831,
+      "median_ms": 100,
+      "min_ms": 11,
+      "n": 15,
+      "p90_ms": 7997,
+      "sum_ms": 18722
+    }
+  },
+  "job_costs_basis": "every `<kind> took N ms off the frame|on the main thread` line the leg's page beaconed, over the whole leg, all page loads",
+  "leg_id": "20260913-macos-macmini-m2-8g-safari-safari-WALL4",
+  "leg_liveness": {
+    "boot_s_after_navigate": 1.03,
+    "budget_state_ticks_beaconed": 77,
+    "canvas_screenshot_blank": false,
+    "jobs_completed": 8791,
+    "last_tick_page_s": 153.7,
+    "page_screenshot_blank": false,
+    "reading": "boots, ticks through the window, paints a non-blank canvas, no refusal and no trap",
+    "smoke_pass": true
+  },
+  "mac_memory_side_effects": {
+    "after_all_mac_legs": "2026-09-12 21:19:27 CDT: swap total 3072 MiB used 1929 MiB (a swap file was added); memory free 73%",
+    "baseline_before_mac_legs": "2026-09-12 21:03:54 CDT: swap total 2048 MiB used 1036 MiB; memory free 68%",
+    "calibrate_runs": [
+      {
+        "idle_exit_kills": 11,
+        "non_idle_kills": 0,
+        "run": 1,
+        "webcontent": "exceeded mem limit: ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "1x event 16, critical 0",
+        "window": "21:04:35-21:05:35"
+      },
+      {
+        "idle_exit_kills": 7,
+        "non_idle_kills": 0,
+        "run": 2,
+        "webcontent": "exceeded mem limit: ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "1x event 16, critical 0",
+        "window": "21:06:35-21:07:35"
+      },
+      {
+        "idle_exit_kills": 6,
+        "non_idle_kills": 0,
+        "run": 3,
+        "webcontent": "exceeded mem limit: ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "1x event 16, critical 0",
+        "window": "21:08:42-21:09:40"
+      }
+    ],
+    "method": "/usr/bin/log show over each window, kernel `memorystatus: killing` and `exceeded mem limit`, WebKit MemoryPressure `Received memory pressure`; idle-exit kills are daemons memorystatus reaps when idle under pressure (e.g. helpd, maild, tailspind); no non-idle process was killed",
+    "scenes": {
+      "WALL1": {
+        "idle_exit_kills": 0,
+        "non_idle_kills": 0,
+        "webcontent": "exceeded ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "1x event 16, critical 0",
+        "window": "21:10:36-21:13:20"
+      },
+      "WALL4": {
+        "idle_exit_kills": 0,
+        "non_idle_kills": 0,
+        "webcontent": "exceeded ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "1x event 16, critical 0",
+        "window": "21:13:20-21:16:00"
+      },
+      "WALL6": {
+        "idle_exit_kills": 0,
+        "non_idle_kills": 0,
+        "webcontent": "exceeded ActiveSoft 2048 MB (non-fatal)",
+        "webkit_pressure_events": "3x: event 16 critical 0; event 16 critical 1; event 32 critical 1 (system vm pressure CRITICAL)",
+        "window": "21:16:00-21:18:45"
+      }
+    }
+  },
+  "provenance": {
+    "calibrate_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/scenes/safari.calibrate.json",
+    "leg_json": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/scenes/safari.WALL4.json",
+    "report_log": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/scenes/safari.WALL4.report.jsonl",
+    "run_id": "wall-20260913T021321Z-1443414-13290",
+    "samples_tsv": "/home/reddragon/.cache/lane-m1-wall-rig-out/mac/scenes/safari.WALL4.samples.tsv",
+    "wasm_sha256": "b5c931d322d36449fe9445162dc2adc89dee3c9092698115f093ec2fafea7bed"
+  },
+  "scene": "WALL4",
+  "smoke_pass": true,
+  "tree_dirty_files": 0,
+  "wall": {
+    "alloc_failures": 0,
+    "booted": true,
+    "budget_pressure_events": 0,
+    "census_last_resident_b": 515311433,
+    "deaths": 0,
+    "instantiate_fallbacks": 0,
+    "ladder_largest_mib": 4096,
+    "page_ceiling_mib": 1024,
+    "page_hw_mib": 627,
+    "residue_mib": 3119,
+    "sum_hw_mib": 977,
+    "ticks": 75,
+    "wall_mib": 4096,
+    "worker_ceiling_mib": 1024,
+    "worker_hw_mib": 350
+  },
+  "wall_basis": {
+    "ceilings": "`heap max a/b` on the last tick (MiB)",
+    "census_last": "the last `heap census (page)` line of the window",
+    "deaths": "reloads and crashes a driver saw; page loads after the first in a beaconed log; null for a text dump, which cannot see one",
+    "page_hw_mib": "the higher of the highest page `linear` figure on a `budget state:` tick and the page level an `alloc failed: ... in page` line reports (MiB)",
+    "reading_window": "the FIRST page load: every line before the first death",
+    "residue_mib": "wall_mib minus sum_hw_mib: negative means the app's linear memory ALONE passed that device's measured wall",
+    "sum_hw_mib": "the highest page+worker `linear` pair on ONE tick, never the page peak plus the worker peak (MiB)",
+    "wall_mib": "MiB of incompressible, touched linear memory the calibrate leg on the same device and browser survived",
+    "worker_hw_mib": "the highest worker `linear` figure on a `budget state:` tick (MiB)"
+  },
+  "wall_mib": 4096,
+  "window_s": 150.0
+}

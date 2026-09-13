@@ -6,3 +6,6 @@ linux-desktop-x86_64	chromium	WALL6	1024	1024	4096	20260913-linux-desktop-x86_64
 ios-iphone13pro-safari-tab	safari	WALL1	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL1	31bd50823c1b	2026-09-13
 ios-iphone13pro-safari-tab	safari	WALL4	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL4	31bd50823c1b	2026-09-13
 ios-iphone13pro-safari-tab	safari	WALL6	512	256	2304	20260913-ios-iphone13pro-safari-tab-safari-WALL6	31bd50823c1b	2026-09-13
+macos-macmini-m2-8g-safari	safari	WALL1	1024	1024	4096	20260913-macos-macmini-m2-8g-safari-safari-WALL1	7e4e5883600b	2026-09-13
+macos-macmini-m2-8g-safari	safari	WALL4	1024	1024	4096	20260913-macos-macmini-m2-8g-safari-safari-WALL4	7e4e5883600b	2026-09-13
+macos-macmini-m2-8g-safari	safari	WALL6	1024	1024	4096	20260913-macos-macmini-m2-8g-safari-safari-WALL6	7e4e5883600b	2026-09-13
