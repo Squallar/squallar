@@ -71,6 +71,22 @@
 #      floor every six-pane figure is read against.
 #   PIN1  REST1 parked on the same instant. Also spelled REST1P.
 #
+# The WALL arms (M1, 2026-09-12). `run_wall_arm.sh` runs them until the page
+# dies or 150 s pass, per device, to find the web memory wall; they are here
+# for the memory arms' reason -- ONE definition a lane references by name.
+#
+#   WALL1  1 pane, KTLX, RadarSites + RadarCoverage, not looping, no gesture.
+#      BYTE-IDENTICAL to `run_tier2.sh`'s `SEED_LS` -- the scene the
+#      behavioural gate boots -- so a device that cannot survive WALL1 cannot
+#      survive the gate's own page. Pinned by `wall1_is_the_tier2_gate_scene`.
+#   WALL4  HEAVY6 with its last two panes removed: 4 panes, FOUR sites (KTLX
+#      KINX KVNX KFDR), every pane layer-unlinked, the whole layer stack
+#      (`ALL_LAYERS`), every pane LOOPING (`loop_playback` playing, lookback
+#      3600 / 10 fps), pan-zoom-2d. Differs from WALL6 in pane count alone.
+#   WALL6  HEAVY6 itself, by alias: the six-pane design scene the RSS
+#      campaign measured. An alias rather than a copy, so the wall and the RSS
+#      rows can never be two different six-pane scenes under two names.
+#
 # No leg here measures RSS: this file measures frame cost. What the memory arms
 # get from being scenes is ONE definition -- `native_row.py verify-seed <file>`
 # answers "is this the PIN6 the table defines?" against a lane's own copy, and
@@ -240,6 +256,8 @@
 #                     are also not in the default set: they are six-pane
 #                     scenes belonging to the RSS campaign, and a frame-cost
 #                     row taken on one is a six-pane row, not a scene-A one.
+#                     The WALL arms WALL1/WALL4/WALL6 are accepted on the same
+#                     terms; they belong to run_wall_arm.sh (M1).
 #   RIG_SETTLE        seconds before the warm rAF sample (default 6)
 #   RIG_MEASURE_WINDOW  seconds of scripted time after settle (default 46 --
 #                     at least two full 20 s script loops, so the window is
@@ -468,11 +486,17 @@ ALL_LAYERS_NO_MRMS='\"ModelData\":true,\"SpcOutlook\":true,\"Radar\":true,\"SpcD
 # here: `seed_LIVE6.json` and `seed_HEAVY6.json` were byte-identical in every
 # worktree that held either, and so were `seed_HEAVY6P.json`/`seed_PIN6.json`
 # and `seed_REST1P.json`/`seed_PIN1.json`. Recorded, not declared.
+#
+# `WALL6` is the one alias that is DECLARED rather than recorded: the wall
+# arm (`run_wall_arm.sh`) names the six-pane design scene, and that scene is
+# HEAVY6. A copy under a third name would be the drift this function exists
+# to end.
 scene_alias() {
   case "$1" in
     LIVE6)   echo HEAVY6 ;;
     HEAVY6P) echo PIN6 ;;
     REST1P)  echo PIN1 ;;
+    WALL6)   echo HEAVY6 ;;
     *)       echo "$1" ;;
   esac
 }
@@ -500,6 +524,8 @@ scene_seed() {
     NOMRMS6) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":6,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KINX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KVNX'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KFDR'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KICT'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'',{\"site\":\"KDDC'"$MEM_PANE_MID"'{'"$ALL_LAYERS_NO_MRMS"'}'"$MEM_LOOP_TAIL""$MEM_PARK_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     REST1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}''}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
     PIN1) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":1,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_PARK_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1"}' ;;
+    WALL1) echo '{"squallar.ui": "{\"pane_count\":1,\"panes\":[{\"site\":\"KTLX\",\"enabled_overlays\":{\"RadarSites\":true,\"RadarCoverage\":true}}]}", "squallar.raster_telemetry": "1", "squallar.frame_telemetry": "1"}' ;;
+    WALL4) echo '{"squallar.ui": "{'"$PANEL_SEED$LOOP_SEED"'\"pane_count\":4,\"panes\":[{\"site\":\"KTLX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KINX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KVNX'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'',{\"site\":\"KFDR'"$MEM_PANE_MID"'{'"$ALL_LAYERS"'}'"$MEM_LOOP_TAIL"'}'']}", "squallar.frame_telemetry": "1", "squallar.raster_telemetry": "1", "squallar.gesture_script": "pan-zoom-2d"}' ;;
     *) return 1 ;;
   esac
 }
@@ -512,6 +538,8 @@ scene_script() {
     E1)     echo none ;;
     HEAVY6|PIN6|NOMRMS6) echo pan-zoom-2d ;;
     REST1|PIN1)          echo none ;;
+    WALL1)               echo none ;;
+    WALL4)               echo pan-zoom-2d ;;
   esac
 }
 

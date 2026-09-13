@@ -9131,7 +9131,8 @@ class MemoryArmSeedTests(unittest.TestCase):
 
     def test_every_memory_arm_is_seedable_and_distinct(self):
         seeds = {}
-        for name in ("HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1"):
+        for name in ("HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1",
+                     "WALL1", "WALL4"):
             seeds[name] = json.loads(scene_from_shell(name))
         # Distinct: an arm that silently equals another is a pair whose
         # difference is zero, and every figure read against it is noise.
@@ -9144,7 +9145,7 @@ class MemoryArmSeedTests(unittest.TestCase):
 
     def test_each_alias_seeds_byte_for_byte_what_it_aliases(self):
         for alias, canonical in (("LIVE6", "HEAVY6"), ("HEAVY6P", "PIN6"),
-                                 ("REST1P", "PIN1")):
+                                 ("REST1P", "PIN1"), ("WALL6", "HEAVY6")):
             self.assertEqual(
                 scene_from_shell(alias), scene_from_shell(canonical),
                 "%s and %s are two spellings of one arm and must seed one "
@@ -9171,6 +9172,7 @@ class MemoryArmSeedTests(unittest.TestCase):
         self.assertEqual(aliases.get("LIVE6"), "HEAVY6")
         self.assertEqual(aliases.get("HEAVY6P"), "PIN6")
         self.assertEqual(aliases.get("REST1P"), "PIN1")
+        self.assertEqual(aliases.get("WALL6"), "HEAVY6")
         for alias in aliases:
             self.assertNotIn(alias, canonical,
                              "%s is both an alias and an arm" % alias)
@@ -9196,8 +9198,11 @@ class MemoryArmSeedTests(unittest.TestCase):
         """
         seed = json.loads(scene_from_shell("HEAVY6"))
         ui = json.loads(seed["squallar.ui"])
-        ui["pane_count"] = 4
-        del ui["panes"][4:]
+        # One pane moved to a site no arm names. This was "HEAVY6 cut to four
+        # panes" until 2026-09-12, when WALL4 made that exact variant an arm
+        # and this test started reading MATCH -- a variant has to be a seed
+        # the table does NOT define, and a site change stays one.
+        ui["panes"][5]["site"] = "KAMA"
         seed["squallar.ui"] = json.dumps(ui)
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
@@ -9216,7 +9221,7 @@ class MemoryArmSeedTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertIn("NO MATCH", out)
             self.assertIn("nearest arm: HEAVY6", out)
-            self.assertIn("pane_count", out)
+            self.assertIn("panes[5].site", out)
             # The positive half: the SAME command on an untouched arm matches,
             # so "NO MATCH" above is a reading and not this command's floor.
             with tempfile.NamedTemporaryFile("w", suffix=".json",
@@ -9248,6 +9253,80 @@ class MemoryArmSeedTests(unittest.TestCase):
         """
         with self.assertRaises(SystemExit):
             table_scene_names(source="nothing that defines a scene table")
+
+
+class WallArmSeedTests(unittest.TestCase):
+    """The M1 wall arms, held to what `run_measure.sh`'s header says they are.
+
+    WALL1 is the Tier-2 gate's own scene, WALL4 is HEAVY6 cut to its first four
+    panes, WALL6 is HEAVY6 by alias. `verify-seed` covers all three without
+    being told about them, because it reads the table; the last test here is
+    what shows that is true rather than assumed.
+    """
+
+    def _tier2_seed(self):
+        text = _read(os.path.join(RIG_DIR, "run_tier2.sh"))
+        found = [l for l in text.splitlines() if l.startswith("SEED_LS='")]
+        self.assertEqual(len(found), 1, "run_tier2.sh's SEED_LS moved")
+        return found[0][len("SEED_LS='"):-1]
+
+    def _verify(self, seed_text):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as fh:
+            fh.write(seed_text)
+            path = fh.name
+        try:
+            buf = io.StringIO()
+            old, sys.stdout = sys.stdout, buf
+            try:
+                rc = cmd_verify_seed(argparse.Namespace(
+                    file=path, scene=None, panel="off", max_diff=40))
+            finally:
+                sys.stdout = old
+            return rc, buf.getvalue()
+        finally:
+            os.unlink(path)
+
+    def test_wall1_is_byte_for_byte_the_tier2_gate_scene(self):
+        self.assertEqual(
+            scene_from_shell("WALL1"), self._tier2_seed(),
+            "WALL1 must be the page the Tier-2 gate boots, or a device's WALL1 "
+            "reading says nothing about the gate's scene")
+
+    def test_wall4_is_heavy6_cut_to_its_first_four_panes(self):
+        heavy = json.loads(scene_from_shell("HEAVY6"))
+        wall4 = json.loads(scene_from_shell("WALL4"))
+        ui_h = json.loads(heavy.pop("squallar.ui"))
+        ui_w = json.loads(wall4.pop("squallar.ui"))
+        self.assertEqual(heavy, wall4, "WALL4 differs from HEAVY6 outside the UI")
+        self.assertEqual(ui_w["pane_count"], 4)
+        self.assertEqual(ui_w["panes"], ui_h["panes"][:4])
+        self.assertEqual([p["site"] for p in ui_w["panes"]],
+                         ["KTLX", "KINX", "KVNX", "KFDR"])
+        for k in ("pane_count", "panes"):
+            ui_h.pop(k)
+            ui_w.pop(k)
+        self.assertEqual(ui_h, ui_w,
+                         "WALL4 differs from HEAVY6 in more than its panes")
+
+    def test_verify_seed_answers_for_every_wall_arm(self):
+        for name, want in (("WALL1", "MATCH WALL1"), ("WALL4", "MATCH WALL4"),
+                           ("WALL6", "MATCH HEAVY6")):
+            rc, out = self._verify(scene_from_shell(name))
+            self.assertEqual(rc, 0, out)
+            self.assertIn(want, out)
+        rc, out = self._verify(scene_from_shell("HEAVY6"))
+        self.assertIn("WALL6", out, "the alias is not named beside HEAVY6")
+        # The negative: one field off WALL4 is a variant NEAREST WALL4, so the
+        # MATCH lines above are readings and not this command's floor.
+        seed = json.loads(scene_from_shell("WALL4"))
+        ui = json.loads(seed["squallar.ui"])
+        ui["pane_count"] = 5
+        seed["squallar.ui"] = json.dumps(ui)
+        rc, out = self._verify(json.dumps(seed))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("nearest arm: WALL4", out)
 
 
 class TelemetrySeedTests(unittest.TestCase):
@@ -9338,21 +9417,22 @@ class TelemetrySeedTests(unittest.TestCase):
         real = _read(RUN_MEASURE_SH)
         drop = ', "squallar.raster_telemetry": "1"'
         self.assertEqual(
-            real.count(drop), 12,
+            real.count(drop), 14,
             "the raster seed spelling moved; this tamper no longer reaches "
             "the scenes it means to break")
         # Break the LAST arm alone -- the one added most recently, and the one
         # a hand-listed scene set is likeliest to have missed. That was E3
-        # until the memory arms landed on 2026-09-11 and is PIN1 now; the
+        # until the memory arms landed on 2026-09-11, PIN1 until the WALL arms
+        # landed on 2026-09-12, and is WALL4 now; the
         # choice is "whatever is last", not a named scene, which is why this
         # kept working across that change. The count above is what notices a
         # scene arriving, and it is deliberately a NUMBER: an arm added
-        # without a telemetry switch would leave it at 12 and reach this
+        # without a telemetry switch would leave it at 14 and reach this
         # assertion, not the rule's own.
         at = real.rindex(drop)
         broken = real[:at] + real[at + len(drop):]
         self.assertNotEqual(broken, real)
-        self.assertEqual(broken.count(drop), 11)
+        self.assertEqual(broken.count(drop), 13)
 
         defects = telemetry_seed_defects({"run_measure.sh": broken})
         self.assertEqual(
@@ -9536,7 +9616,9 @@ class ViewportPinTests(unittest.TestCase):
              # The memory arms, on the table since 2026-09-11. Canonical
              # names only: `scene_alias` resolves LIVE6/HEAVY6P/REST1P before
              # the `case`, so they are not arms and must not appear here.
-             "HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1"])
+             "HEAVY6", "PIN6", "NOMRMS6", "REST1", "PIN1",
+             # The wall arms (M1, 2026-09-12); WALL6 is an alias of HEAVY6.
+             "WALL1", "WALL4"])
 
         # A scene added to the table is picked up unasked -- the property the
         # sweep depends on, and the one a listed tuple does not have.

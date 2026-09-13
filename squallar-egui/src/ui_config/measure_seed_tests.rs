@@ -238,6 +238,35 @@ const SCENES: &[Scene] = &[
         parked: true,
         layers_off: &[],
     },
+    // ---- the wall arms (M1) ------------------------------------------------
+    //
+    // `run_wall_arm.sh` runs these until the page dies, per device. WALL1 is
+    // the Tier-2 gate's own scene (two layers, and `wall1_is_the_tier2_gate_scene`
+    // holds it to that byte for byte); WALL4 is HEAVY6 cut to its first four
+    // panes; WALL6 is HEAVY6 by alias and so is covered by HEAVY6's row and
+    // the alias test below rather than by a row of its own.
+    Scene {
+        name: "WALL1",
+        panes: 1,
+        sites: 1,
+        volume_panes: 0,
+        script: None,
+        all_layers: false,
+        looping: false,
+        parked: false,
+        layers_off: &[],
+    },
+    Scene {
+        name: "WALL4",
+        panes: 4,
+        sites: 4,
+        volume_panes: 0,
+        script: Some("pan-zoom-2d"),
+        all_layers: true,
+        looping: true,
+        parked: false,
+        layers_off: &[],
+    },
 ];
 
 /// The scenes a `case` body can answer for, whatever whitespace separates the
@@ -740,5 +769,46 @@ fn scene_c_header_states_the_site_count_its_seed_produces() {
     assert!(
         !line.contains("two sites"),
         "scene C's header still says two sites: {line:?}",
+    );
+}
+
+/// The Tier-2 launcher, read at compile time for [`wall1_is_the_tier2_gate_scene`].
+const RUN_TIER2: &str = include_str!("../../../.github/browser-rig/run_tier2.sh");
+
+/// **WALL1 is the scene the Tier-2 gate boots, byte for byte.**
+///
+/// The wall arm's control row exists to answer one question the gate cannot:
+/// does THIS device survive the page the gate calls healthy? That answer only
+/// transfers if the two seeds are one seed. `run_measure.sh`'s header claims
+/// they are byte-identical, so the claim is held here as bytes and not as a
+/// parsed-equal pair: a reordering that parses the same is still a second
+/// spelling somebody has to keep in step.
+#[test]
+fn wall1_is_the_tier2_gate_scene() {
+    let line = RUN_TIER2
+        .lines()
+        .find(|l| l.starts_with("SEED_LS='"))
+        .expect("run_tier2.sh no longer assigns `SEED_LS='` on its own line");
+    let tier2 = line
+        .strip_prefix("SEED_LS='")
+        .and_then(|l| l.strip_suffix('\''))
+        .expect("the SEED_LS assignment is not closed on its own line");
+    let wall1 = RUN_MEASURE
+        .lines()
+        .find_map(|l| l.strip_prefix("    WALL1) echo '"))
+        .and_then(|l| l.strip_suffix("' ;;"))
+        .expect("run_measure.sh has no single-literal `WALL1) echo '…' ;;` arm");
+    assert_eq!(
+        wall1, tier2,
+        "WALL1 is no longer byte-identical to run_tier2.sh's SEED_LS, so a \
+         device's WALL1 reading no longer says anything about the page the \
+         Tier-2 gate calls healthy",
+    );
+    // Non-vacuity: the pair is equal AND is a scene, so this is not two empty
+    // strings agreeing.
+    let parsed = scene_seed("WALL1");
+    assert!(
+        parsed.get("squallar.ui").and_then(|v| v.as_str()).is_some(),
+        "WALL1 parses but carries no `squallar.ui` scene: {parsed}",
     );
 }
