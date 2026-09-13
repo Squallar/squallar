@@ -304,3 +304,70 @@ the backend beside the arm in every Mac figure, and expect upload and residency
 shape to differ from Linux for backend reasons before GPU or OS ones. Under
 WebGPU the frame tail is the `ui` segment, not `finish`: submit reads 11–18 us
 mean here against 604–677 on Linux GL.
+
+## Safari (desktop) on the Mac mini: the M1 wall legs (RAN 2026-09-13)
+
+macOS 26.4.1, Safari 26.4, Mac14,3 (Apple M2, 8 GiB), KVM on the Mac (real
+3440x1440 panel, devicePixelRatio 1; a 1920x1080 display also online). Rows are
+in `.github/browser-rig/wall-ceilings.tsv` under `macos-macmini-m2-8g-safari`,
+with evidence in `.github/browser-rig/wall-evidence/`.
+
+**How it was driven: from the Linux box, with nothing installed on the Mac.** The
+wrapper `/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/safaridriver-desktop-via-mac`
+runs the Mac's `/usr/bin/safaridriver` over ssh. It forwards drive.py's driver
+port (`-L`) and, when `RIG_REVERSE_PORT` is set, the Mac's
+`127.0.0.1:<port>` back to the rig server on Linux (`-R`). Safari therefore loads
+`http://127.0.0.1:<port>`: a secure context, so COOP/COEP give
+`crossOriginIsolated` true with no certificate to trust on the Mac. The app's
+data fetches go from the Mac to the internet directly; only the bundle and the
+beacons cross the tunnel.
+
+```bash
+cd /home/reddragon/.cache/lane-m1-wall-rig
+M=/home/reddragon/.cache/lane-m1-wall-rig-out/mac
+export RIG_SAFARIDRIVER=/home/reddragon/.cache/lane-m1-wall-rig-out/iphone/safaridriver-desktop-via-mac \
+  RIG_SERVE_HOST=127.0.0.1 RIG_URL_HOST=127.0.0.1 RIG_ARM=hardware RIG_DEVICE_CLASS=macos-macmini-m2-8g-safari
+for n in 1 2 3; do RIG_REVERSE_PORT=861$n RIG_SERVE_PORT=861$n RIG_OUT_DIR=$M/cal$n \
+  bash .github/browser-rig/run_wall_arm.sh --skip-build --scenes "" safari; done
+RIG_REVERSE_PORT=8620 RIG_SERVE_PORT=8620 RIG_OUT_DIR=$M/scenes \
+RIG_CALIBRATE_JSONS="$M/cal1/safari.calibrate.json $M/cal2/safari.calibrate.json $M/cal3/safari.calibrate.json" \
+RIG_DEVICE_INFO_JSON=$M/device-reported.json \
+  bash .github/browser-rig/run_wall_arm.sh --skip-build --scenes "WALL1 WALL4 WALL6" safari
+```
+
+The server and the reverse forward must use the SAME fixed port, so
+`RIG_SERVE_PORT` equals `RIG_REVERSE_PORT`.
+
+Traps, each met on this leg:
+- **A stale automation Safari blocks every session.** A `Safari --automation` process from 12 days earlier (pid 5711) was still running. safaridriver paired with it and timed out 30 s later. From `/usr/bin/log show`, process `com.apple.WebDriver.HTTPService`, subsystem `com.apple.Safari`: `found a matching RWIApplication (PID:5711)` … `Pairing Requested` … `bootstrap failed: … The session timed out while connecting to a Safari instance … Request to pair with an automation session`. Killing that PID fixed it, and the next session launched a fresh automation Safari. **The rig's own sessions leave an automation Safari running too: kill it by PID when the legs are done** (check its args and start time first).
+- **Never run `/Applications/Safari.app/Contents/MacOS/Safari --version`.** It prints nothing and starts a Safari process, which hung the ssh command until timeout and was left running.
+- Remote automation was already allowed: `defaults read com.apple.Safari` shows `DidMigrateWebDriverAllowRemoteAutomation = 1` and the Develop menu on. No setting was changed.
+- `log` is a zsh builtin in the Mac's login shell: use `/usr/bin/log show`. Its `--start` takes whole seconds only.
+
+Signals every page read: screen 3440x1440, devicePixelRatio 1,
+hardwareConcurrency 8, maxTouchPoints 0, platform `MacIntel`, UA frozen at
+`Intel Mac OS X 10_15_7`, `navigator.deviceMemory` ABSENT,
+`performance.measureUserAgentSpecificMemory` ABSENT, app backend BrowserWebGpu.
+Automation sessions start on EMPTY website data: a second session on the same
+origin read 0 localStorage keys.
+
+| Leg | Reading | Denominator |
+|---|---|---|
+| calibrate 1, 2, 3 | ladder 4096..128 MiB all construct; each run reached the **4 GiB cap** (4096 MiB touched and alive) in ~40 s; localStorage and /rig/report agree | 135 steps of 32 MiB xorshift bytes, one shared memory |
+| WALL1 | boots; no death in 150 s; page 92 / worker 124 MiB, 216 on one tick; ceilings 1024/1024 | 45 ticks |
+| WALL4 | boots; no death; page 627 / worker 350, 977 on one tick; no refusal | 75 driven / 77 beaconed ticks |
+| WALL6 | boots; no death; page 777 / worker 387, 1164 on one tick; no refusal; drove the Mac to `system vm pressure critical: 1` | 50 driven / 73 beaconed ticks |
+
+- **The wall is a FLOOR.** One wasm32 memory cannot exceed 4 GiB, so the probe never reached this Mac's kill point, and wall_mib 4096 is the cap.
+- **WALL6's driven scrape missed ticks and the last census:** ~103k job lines turned the 1200-entry console ring over faster than the 2 s scrape. The beaconed log is the complete record there.
+
+Memory side effects (kernel `memorystatus` and WebKit `MemoryPressure` lines
+over each leg's window):
+- Every calibrate run and every scene: `com.apple.WebKit.WebContent [...] exceeded mem limit: ActiveSoft 2048 MB (non-fatal)`. macOS holds WebContent to a *soft* 2 GiB and lets it continue, where the iPhone's WebContent died at 2304–2848 MiB.
+- Calibrate runs: memorystatus reaped idle daemons (`killing (idle) … due to idle-exit`), 11, 7 and 6 per run (helpd, maild, tailspind, …). **No non-idle process was killed**, and none during the scenes.
+- Swap went from 1036 to ~1950 MiB used, and macOS added a swap file (2048 → 3072 MiB total). After the legs: 1897 MiB used, 73% free.
+
+The location prompt: squallar's location gate asks at startup on every fresh
+origin, so desktop Safari was asked too. Nobody was at the Mac to see it. Every
+leg booted, ticked through its window and painted a non-blank canvas. Each
+evidence file states it as a confounder.
