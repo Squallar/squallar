@@ -68,6 +68,8 @@ fn app_playing(
     let (mut app, _asked) = app_with_frames(Vec::new());
     {
         let pane = app.gui.pane_mut(0).expect("pane 0");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let ls = pane.transport_state_mut();
         *ls = LayerTimeState::begin(
             3600,

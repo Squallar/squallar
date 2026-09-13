@@ -2776,6 +2776,11 @@ impl InputHarness {
 #[cfg(test)]
 mod pane_layout_tests;
 
+/// Back and the Set Time dialog's OK clear the live flag without bringing back
+/// a clock the rule declared dead.
+#[cfg(test)]
+mod flag_clear_clock_tests;
+
 /// The click-registry gate (WO-4): one UiSweep loop drives the real widgets
 /// through the real input path, counted from the registry.
 #[cfg(test)]

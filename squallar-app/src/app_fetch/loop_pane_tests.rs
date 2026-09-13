@@ -50,6 +50,8 @@ fn pane_showing(site: RadarSite, timestamp: NaiveDateTime) -> PaneState {
 /// that does not.
 fn pane_looping_on(site: RadarSite, lookback_secs: u64, frames: &[u32]) -> PaneState {
     let mut panes = [PaneState::with_site(site.name.to_string())];
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    panes[0].begin_or_continue_loop();
     *panes[0].time_state_mut(&known::RADAR) = squallar_egui::radar_layer::begin_loop(
         lookback_secs,
         &site,
@@ -661,7 +663,7 @@ fn a_live_panes_window_is_still_anchored_on_its_newest_frame() {
     let ktlx = site("KTLX", 35.33, -97.27);
     let mut panes = [pane_looping_on(ktlx, 600, &[0, 5, 10])];
     assert!(
-        matches!(panes[0].time.mode, squallar_egui::pane::TimeMode::Live),
+        matches!(panes[0].time_mode(), squallar_egui::pane::TimeMode::Live),
         "precondition: a pane is live until something parks it"
     );
 

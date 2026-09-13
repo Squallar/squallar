@@ -230,6 +230,15 @@ fn an_overlay_token_move_repaints_exactly_once() {
             + chrono::Duration::hours(hours)
     };
     let mut h = resolved_floor_harness();
+    // Pane 1 keeps its own clock. Linked, it would take pane 0's live flag back
+    // every frame (the time link carries the flag, not the clock), and a live
+    // pane with no loop running depicts now whatever its clock was set to.
+    h.gui_mut().pane_mut(1).expect("pane 1").time_link = false;
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    h.gui_mut()
+        .pane_mut(1)
+        .expect("pane 1")
+        .set_viewing_live(false);
     h.gui_mut()
         .pane_mut(1)
         .expect("pane 1")
@@ -385,6 +394,8 @@ fn a_loop_tick_repaints_the_floor_exactly_once() {
 
     {
         let pane = h.gui_mut().pane_mut(1).expect("pane 1");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let state = pane.time_state_mut(&known::RADAR);
         state.phase = LoopPhase::Paused;
         state.frames = (0..2)
@@ -734,6 +745,8 @@ fn a_playing_volume_loop_repaints_the_floor_per_tick_not_per_frame() {
     h.frames_for(4, FRAME_DT);
     {
         let pane = h.gui_mut().pane_mut(1).expect("pane 1");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let state = pane.time_state_mut(&known::RADAR);
         state.phase = LoopPhase::Playing;
         state.view = RenderView::Volume;

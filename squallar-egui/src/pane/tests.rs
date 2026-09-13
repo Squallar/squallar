@@ -1616,6 +1616,8 @@ fn an_empty_timeline_names_no_frame_and_does_not_panic() {
 #[test]
 fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
     let mut pane = PaneState::new();
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(6);
     // A second frame-series layer on a coarser cadence: frames at 0 and 4.
     let mut model = timeline_at_minutes(6);
@@ -1640,7 +1642,7 @@ fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
     // Said by index instead, on radar's frame 2, which is 2 minutes.
     assert!(pane.park_on_frame(&known::RADAR, 2), "frame 2 exists");
     assert_eq!(
-        pane.time.mode,
+        pane.time_mode(),
         TimeMode::AsOf(ts(2)),
         "parking on a frame moves the CLOCK to that frame's stamp",
     );
@@ -1650,7 +1652,7 @@ fn the_clock_moves_the_playhead_and_two_layers_land_on_one_instant() {
         "an index naming no frame moves nothing",
     );
     assert_eq!(
-        pane.time.mode,
+        pane.time_mode(),
         TimeMode::AsOf(ts(2)),
         "and the clock did not move"
     );
@@ -1797,6 +1799,8 @@ fn the_clock_follows_the_topmost_animating_layer() {
 #[test]
 fn eviction_keeps_the_pane_on_the_moment_it_was_parked_at() {
     let mut pane = PaneState::new();
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     *pane.time_state_mut(&known::RADAR) = timeline_at_minutes(5);
     assert!(
         pane.park_on_frame(&known::RADAR, 2),
@@ -1885,6 +1889,8 @@ fn a_layer_whose_frames_all_postdate_the_clock_draws_nothing() {
             render_failed: false,
         })
         .collect();
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     *pane.time_state_mut(&known::RADAR) = radar;
 
     // The long-span layer, holding a frame at the clock itself.

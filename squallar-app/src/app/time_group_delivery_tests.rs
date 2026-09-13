@@ -24,7 +24,7 @@ fn two_parked_panes() -> App {
     let mut app = two_pane_app(SITE, SITE);
     for idx in 0..2 {
         let pane = app.gui.pane_mut(idx).expect("the fixture built two panes");
-        pane.viewing_live = false;
+        pane.set_viewing_live(false);
         pane.scan_info = Some(squallar_radar::types::ScanInfo::from_scan(
             &empty_scan(),
             SITE,

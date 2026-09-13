@@ -187,11 +187,17 @@ fn a_scrub_buys_no_round_on_a_layer_whose_request_ignores_the_clock() {
             .set_overlay_enabled(kind.clone(), true);
     }
     gui.pane_mut(1).expect("two panes").layer_link = false;
-    gui.pane_mut(1).expect("two panes").time.mode = crate::pane::TimeMode::AsOf(
-        chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
-            .and_then(|d| d.and_hms_opt(12, 0, 0))
-            .expect("a real instant"),
-    );
+    // A scrub clears the live flag. Without it pane 1 still depicts now, the
+    // two panes ask the same thing whether or not the ask carries the clock,
+    // and this test cannot tell the difference it exists to pin.
+    gui.pane_mut(1).expect("two panes").set_viewing_live(false);
+    gui.pane_mut(1)
+        .expect("two panes")
+        .set_time_mode(crate::pane::TimeMode::AsOf(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+                .and_then(|d| d.and_hms_opt(12, 0, 0))
+                .expect("a real instant"),
+        ));
 
     let mut actions = Vec::new();
     gui.check_auto_polls(&mut actions);
@@ -240,11 +246,15 @@ fn a_scrub_earns_a_round_where_the_request_carries_the_clock() {
         "premise: two live panes on this layer are one ask"
     );
 
-    gui.pane_mut(1).expect("two panes").time.mode = crate::pane::TimeMode::AsOf(
-        chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
-            .and_then(|d| d.and_hms_opt(12, 0, 0))
-            .expect("a real instant"),
-    );
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.pane_mut(1).expect("two panes").set_viewing_live(false);
+    gui.pane_mut(1)
+        .expect("two panes")
+        .set_time_mode(crate::pane::TimeMode::AsOf(
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+                .and_then(|d| d.and_hms_opt(12, 0, 0))
+                .expect("a real instant"),
+        ));
     let mut after = Vec::new();
     gui.check_auto_polls(&mut after);
     let rounds: Vec<usize> = after

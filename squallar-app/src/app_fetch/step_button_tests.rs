@@ -71,7 +71,7 @@ fn satellite_only_app() -> (App, Asked) {
 }
 
 fn clock(app: &App) -> TimeMode {
-    app.gui.pane(0).expect("one pane").time.mode
+    app.gui.pane(0).expect("one pane").time_mode()
 }
 
 /// **WO-T3.10's acceptance.** Both step buttons move a satellite-only pane.
@@ -125,7 +125,7 @@ fn the_step_buttons_move_a_satellite_only_pane() {
          `now` rather than from the instant on screen",
     );
     assert!(
-        !app.gui.pane(0).expect("one pane").viewing_live,
+        !app.gui.pane(0).expect("one pane").viewing_live(),
         "the pane still claims to be following live data after a step back",
     );
 
@@ -230,7 +230,7 @@ fn a_radar_panes_step_is_unchanged() {
          selected; one hour off is `data_time`, the raster on screen",
     );
     assert!(
-        !app.gui.pane(0).expect("one pane").viewing_live,
+        !app.gui.pane(0).expect("one pane").viewing_live(),
         "a step back left the pane claiming to follow live data",
     );
 }

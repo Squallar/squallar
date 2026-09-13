@@ -70,6 +70,8 @@ fn a_scrubbed_pane_moves_the_clock_for_the_as_of_dependent_layers_only() {
     let mut gui = Gui::new();
     let scrub = ts(10);
     let clock = ts(30);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.pane_mut(0).expect("pane 0").set_viewing_live(false);
     gui.pane_mut(0)
         .expect("pane 0")
         .set_time_mode(TimeMode::AsOf(scrub));
@@ -126,6 +128,8 @@ fn a_scrubbed_panes_fetch_is_built_for_the_instant_it_depicts() {
     let mut gui = Gui::new();
     let scrub = ts(10);
     let clock = ts(30);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.pane_mut(0).expect("pane 0").set_viewing_live(false);
     gui.pane_mut(0)
         .expect("pane 0")
         .set_time_mode(TimeMode::AsOf(scrub));
@@ -187,13 +191,15 @@ fn a_live_panes_fetch_keeps_the_wall_clock_for_every_layer() {
 /// Lookback slider — and the figure is unchanged by the loop-window read that
 /// `a_poll_before_the_first_listing_asks_for_the_loops_window` pins.
 #[test]
-fn a_pane_on_a_loops_clock_hands_its_span_to_the_as_of_dependent_layers_only() {
+fn a_parked_pane_hands_its_span_to_the_as_of_dependent_layers_only() {
     let mut gui = Gui::new();
     let span_secs = 7200;
     {
         let pane = gui.pane_mut(0).expect("pane 0");
         pane.time.span_secs = span_secs;
-        // What a playing loop writes every tick: the frame it landed on.
+        // A parked pane: the user's instant, no loop armed.
+        // A park clears the live flag, as every scrub, step and Set Time does.
+        pane.set_viewing_live(false);
         pane.set_time_mode(TimeMode::AsOf(ts(10)));
     }
     let clock = ts(30);
@@ -288,6 +294,8 @@ fn a_pane_on_a_loops_clock_names_its_frames_to_the_as_of_dependent_layers_only()
                 render_failed: false,
             })
             .collect();
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         *pane.transport_state_mut() = timeline;
         pane.set_time_mode(TimeMode::AsOf(stamps[0]));
     }
@@ -402,6 +410,8 @@ fn a_poll_before_the_first_listing_asks_for_the_loops_window() {
         let pane = gui.pane_mut(0).expect("pane 0");
         pane.time.span_secs = SLIDER;
         pane.set_transport_layer(transport.clone());
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let ls = pane.transport_state_mut();
         // The state `arm_layer_loop` leaves behind: the window is recorded,
         // the listing is in the air, and no frame has been built yet.
@@ -456,6 +466,8 @@ fn a_parked_pane_with_no_loop_still_asks_for_its_own_span() {
         let ls = pane.transport_state_mut();
         ls.phase = squallar_egui::pane::LoopPhase::Inactive;
         ls.span_secs = 12 * 3600;
+        // A park clears the live flag, as every scrub, step and Set Time does.
+        pane.set_viewing_live(false);
         pane.set_time_mode(TimeMode::AsOf(ts(30)));
     }
     let clock = ts(45);

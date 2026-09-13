@@ -735,7 +735,7 @@ impl Gui {
             GuiEvent::LiveScanInfoForSite { site, info } => {
                 let mut any_pane_took_it = false;
                 for pane in &mut self.panes {
-                    if pane.site() == site && pane.viewing_live {
+                    if pane.site() == site && pane.viewing_live() {
                         pane.scan_info = Some(info.clone());
                         any_pane_took_it = true;
                     }
@@ -781,7 +781,7 @@ impl Gui {
                     // merge below moves `timestamp`, so an ungated pass drags
                     // a parked pane forward exactly as the closed-volume path
                     // did.
-                    if pane.site() != site || !pane.viewing_live {
+                    if pane.site() != site || !pane.viewing_live() {
                         continue;
                     }
                     any_pane_took_it = true;
@@ -843,7 +843,7 @@ impl Gui {
             GuiEvent::SelectedTime(timestamp) => self.time_dialog.select(timestamp),
             GuiEvent::ViewingLiveForPane { pane_idx, live } => {
                 if let Some(pane) = self.panes.get_mut(pane_idx) {
-                    pane.viewing_live = live;
+                    pane.set_viewing_live(live);
                 }
             }
             GuiEvent::PaneTimeSelected {
@@ -852,7 +852,7 @@ impl Gui {
                 live,
             } => {
                 if let Some(pane) = self.panes.get_mut(pane_idx) {
-                    pane.viewing_live = live;
+                    pane.set_viewing_live(live);
                     // **The half the step buttons never had.** `set_time_mode`
                     // settles every layer's playhead onto the new clock, which
                     // is the whole of what makes a pane holding no radar scan
@@ -1109,7 +1109,7 @@ impl Gui {
     pub fn live_sites(&self) -> Vec<String> {
         let mut sites: Vec<String> = Vec::new();
         for pane in self.panes.iter().take(self.pane_layout.pane_count) {
-            if pane.viewing_live
+            if pane.viewing_live()
                 && pane.needs_radar_data()
                 && !sites.iter().any(|s| s.as_str() == pane.site())
             {
@@ -1161,7 +1161,7 @@ impl Gui {
                     {
                         self.time_dialog.timestamp = timestamp;
                         if let Some(pane) = self.panes.get_mut(self.active_pane) {
-                            pane.viewing_live = false;
+                            pane.set_viewing_live(false);
                         }
                         // **The active pane's own site.** There is no
                         // app-wide site to fetch against any more: a pane
@@ -2726,14 +2726,14 @@ impl Gui {
     pub fn is_viewing_live(&self) -> bool {
         self.panes
             .get(self.active_pane)
-            .is_some_and(|p| p.viewing_live)
+            .is_some_and(|p| p.viewing_live())
     }
 
     pub fn is_any_pane_live(&self) -> bool {
         self.panes
             .iter()
             .take(self.pane_layout.pane_count)
-            .any(|p| p.viewing_live)
+            .any(|p| p.viewing_live())
     }
 
     pub fn get_scan_info(&self) -> Option<&ScanInfo> {
@@ -3008,6 +3008,10 @@ mod overlay_retry_tests;
 /// Whose selection an automatic round refreshes, with a split open.
 #[cfg(test)]
 mod poll_fanout_tests;
+
+/// A time link carries the live flag, and a pane it reaches depicts now.
+#[cfg(test)]
+mod time_link_clock_tests;
 
 #[cfg(test)]
 mod overlay_texture_release_tests;

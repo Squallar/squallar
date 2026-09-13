@@ -141,7 +141,9 @@ fn token_pass(at: chrono::NaiveDateTime) -> TokenPass {
         pane.set_overlay_enabled(id.clone(), true);
     }
     pane.hydrate_layer_states(&overlays, 0);
-    pane.time.mode = TimeMode::AsOf(at);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    pane.set_viewing_live(false);
+    pane.set_time_mode(TimeMode::AsOf(at));
 
     asked.store(0, Ordering::Relaxed);
     let tokens = ids

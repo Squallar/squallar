@@ -142,7 +142,7 @@ fn parked_panes(gui: &Gui) -> Vec<(usize, String, chrono::NaiveDateTime)> {
         .iter()
         .enumerate()
         .filter_map(|(idx, pane)| {
-            let instant = pane.time.mode.as_of()?;
+            let instant = pane.time_mode().as_of()?;
             if !pane.is_overlay_enabled(&squallar_source::id::known::RADAR) {
                 return None;
             }
@@ -2831,7 +2831,7 @@ impl App {
                             (0..count).any(|i| {
                                 self.gui
                                     .pane(i)
-                                    .is_some_and(|p| p.site() == site && p.viewing_live)
+                                    .is_some_and(|p| p.site() == site && p.viewing_live())
                             })
                         };
 

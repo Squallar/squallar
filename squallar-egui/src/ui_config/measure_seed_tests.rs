@@ -513,7 +513,7 @@ fn every_measure_scene_seeds_the_layout_it_claims() {
         let parked_at = chrono::NaiveDateTime::parse_from_str(PARK_INSTANT, "%Y-%m-%dT%H:%M:%S")
             .expect("PARK_INSTANT is a parseable instant");
         for (i, pane) in gui.panes().iter().enumerate() {
-            let as_of = pane.time.mode.as_of();
+            let as_of = pane.time_mode().as_of();
             if scene.parked {
                 assert_eq!(
                     as_of,
@@ -524,7 +524,7 @@ fn every_measure_scene_seeds_the_layout_it_claims() {
                      input set per pane",
                 );
                 assert!(
-                    !pane.viewing_live,
+                    !pane.viewing_live(),
                     "scene {name} pane {i} is parked on an instant and STILL \
                      following live arrivals, so its bytes grow with whatever \
                      landed while the leg ran — the one thing a fixed-input \
@@ -537,7 +537,7 @@ fn every_measure_scene_seeds_the_layout_it_claims() {
                      header claims a live arm",
                 );
                 assert!(
-                    pane.viewing_live,
+                    pane.viewing_live(),
                     "scene {name} pane {i} is not following live where its \
                      header claims a live arm",
                 );

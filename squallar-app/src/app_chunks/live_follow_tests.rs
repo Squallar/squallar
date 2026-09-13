@@ -48,7 +48,7 @@ fn a_closed_live_volume_still_reaches_a_time_unlinked_pane_on_the_site() {
          test passes whatever the gate does",
     );
     assert!(
-        app.gui.pane(1).expect("pane 1").viewing_live,
+        app.gui.pane(1).expect("pane 1").viewing_live(),
         "precondition: pane 1 must be watching live — the promise is about a \
          live pane, not about any unlinked one",
     );
@@ -76,10 +76,10 @@ fn a_closed_live_volume_still_reaches_a_time_unlinked_pane_on_the_site() {
 #[test]
 fn a_pane_parked_in_the_archive_is_not_dragged_forward_by_the_live_feed() {
     let mut app = two_live_unlinked_panes();
-    app.gui.pane_mut(0).expect("pane 0").viewing_live = false;
+    app.gui.pane_mut(0).expect("pane 0").set_viewing_live(false);
     let parked = shown_at(&app, 0).expect("the fixture puts a volume on pane 0");
     assert!(
-        app.gui.pane(1).expect("pane 1").viewing_live,
+        app.gui.pane(1).expect("pane 1").viewing_live(),
         "precondition: a live sibling is what keeps the feed running for this \
          site; without one `apply_chunk_outcome` returns early and the case \
          below cannot fail",

@@ -349,7 +349,7 @@ impl super::Gui {
                         }
 
                         let expanded = !self.timeline_collapsed;
-                        let live = self.panes[self.active_pane].viewing_live;
+                        let live = self.panes[self.active_pane].viewing_live();
                         let chip_text = if live {
                             "\u{23fa} Live".to_owned()
                         } else {

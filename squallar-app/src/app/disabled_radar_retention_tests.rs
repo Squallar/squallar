@@ -39,7 +39,7 @@ fn app_on_site(panes: usize) -> App {
     let mut app = n_pane_app(panes, SITE);
     for idx in 0..panes {
         let pane = app.gui.pane_mut(idx).expect("the layout just made it");
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
         assert!(
             pane.is_overlay_enabled(&squallar_source::id::known::RADAR),
             "premise: a pane that has saved nothing draws radar. If a fresh \

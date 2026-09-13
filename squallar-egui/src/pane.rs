@@ -872,10 +872,19 @@ pub fn as_of_bucket(instant: NaiveDateTime, quantum: std::time::Duration) -> i64
 /// [`LayerTimeState`] and are shown at whatever moment this posture names.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PaneTimePosture {
-    /// **The instant this pane depicts** — the clock every layer's playhead is
-    /// derived from, and the one thing a scrub, a step and a playback advance
-    /// all write.
-    pub mode: TimeMode,
+    /// **The instant this pane's clock was last set to** — written by a scrub,
+    /// a step and a playback advance, through [`PaneState::set_time_mode`].
+    ///
+    /// **Private, and read only through [`PaneState::time_mode`]**, because
+    /// what was written is not always what the pane depicts: see that method.
+    /// Keeping the field out of reach is what makes that one read the rule for
+    /// every reader.
+    mode: TimeMode,
+    /// **Which loop, if any, [`Self::mode`] is the playhead of** — the pane's
+    /// loop lineage when the clock was written while its transport ran a loop
+    /// (or restored beside a paused one), `None` otherwise. See
+    /// [`PaneState::time_mode`].
+    owner: Option<u64>,
     /// How far back the pane's timeline reaches, in seconds. The setting a
     /// new listing is asked for; the window a listing was actually built with
     /// is the layer's own [`LayerTimeState::span_secs`].
@@ -907,6 +916,7 @@ impl Default for PaneTimePosture {
     fn default() -> Self {
         Self {
             mode: TimeMode::Live,
+            owner: None,
             span_secs: 3600,
             speed_fps: DEFAULT_LOOP_SPEED_FPS,
             step: TimeStep::Secs(600),
@@ -1051,7 +1061,7 @@ impl<'a> PaneView<'a> {
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
             loading_site: self.loading_site,
-            as_of: self.pane.time.mode.as_of(),
+            as_of: self.pane.time_mode().as_of(),
             // One pane's view carries no peers: a caller that has to weigh
             // the whole layer across panes builds a `PaneRef::across`.
             peers: &[],
@@ -1072,7 +1082,7 @@ impl<'a> PaneView<'a> {
             config: &slot.config,
             state: slot.state.as_deref().map(|s| s as &dyn Any),
             loading_site: self.loading_site,
-            as_of: self.pane.time.mode.as_of(),
+            as_of: self.pane.time_mode().as_of(),
             peers: &[],
         }
     }
@@ -1168,7 +1178,22 @@ pub struct PaneState {
     /// depicts an older instant every frame while still following the live
     /// site. Folding the two would stop the chunk feed the moment a loop
     /// played, which is a behaviour change, not a simplification.
-    pub viewing_live: bool,
+    ///
+    /// **Private, written only through [`Self::set_viewing_live`]**, because
+    /// clearing it is what makes a stored clock readable as a park: see that
+    /// method.
+    viewing_live: bool,
+    /// **The loop this pane is running or waiting to re-arm**, as a lineage
+    /// minted by [`Self::begin_or_continue_loop`] (or by
+    /// [`Self::restore_time_mode`] for a paused loop brought back from a
+    /// file). Kept across a re-arm, replaced when a new loop begins; runtime
+    /// only.
+    loop_lineage: Option<u64>,
+    /// **Where this pane's transport slot sat when last looked for.** A hint,
+    /// validated on every read, so [`Self::time_mode`]'s transport question
+    /// never goes through the slot stack's one-entry memo that the per-layer
+    /// walk depends on.
+    transport_hint: std::cell::Cell<usize>,
     /// **Which group this pane's three links are scoped to** — `None` for a
     /// pane that belongs to no group and so syncs with nobody, whatever its
     /// flags say. Persisted; default [`GroupId::FIRST`], which is what makes
@@ -1329,6 +1354,14 @@ impl Default for LayerTimeState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The next loop lineage — see [`PaneState::begin_or_continue_loop`]. Only
+/// distinctness matters, so one process-wide counter serves every pane, and a
+/// lineage is never persisted.
+fn next_loop_lineage() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl LayerTimeState {
@@ -1963,6 +1996,8 @@ impl PaneState {
             selected_product: radar_fields::known::REFLECTIVITY,
             selected_elevation: 0.0,
             viewing_live: true,
+            loop_lineage: None,
+            transport_hint: std::cell::Cell::new(0),
             group: Some(GroupId::FIRST),
             time_link: true,
             viewport_link: true,
@@ -2286,7 +2321,7 @@ impl PaneState {
     /// the scrubber's resting position and the forward-step enable actually
     /// ask.
     pub fn depicts_future(&self, now: NaiveDateTime) -> bool {
-        let depicted = match self.time.mode {
+        let depicted = match self.time_mode() {
             TimeMode::AsOf(t) => Some(t),
             TimeMode::Live => self.data_time_on_screen(),
         };
@@ -2420,7 +2455,7 @@ impl PaneState {
                 .and_then(|slot| slot.state.as_deref())
                 .map(|s| s as &dyn Any),
             loading_site: self.loading_site.as_deref(),
-            as_of: self.time.mode.as_of(),
+            as_of: self.time_mode().as_of(),
             peers: &[],
         }
     }
@@ -2603,15 +2638,179 @@ impl PaneState {
     /// door: call it after the clock moves or a layer's frame list changes,
     /// and no other code writes a playhead.
     pub fn settle_playheads(&mut self) {
-        let mode = self.time.mode;
+        let mode = self.time_mode();
         for slot in &mut self.layers {
             slot.time.settle_playhead(mode);
         }
     }
 
+    /// **The instant this pane depicts** — the one read of the pane's clock.
+    ///
+    /// What was last written, with one exception: **a pane flagged
+    /// [`Self::viewing_live`] depicts now unless the stored clock is the
+    /// playhead of the loop this pane is running or waiting to re-arm.**
+    /// Playback parks the clock on every frame it shows while the selection
+    /// stays live — the documented split between the two fields — so a clock
+    /// left by a loop that has ended, restored under a live flag from an older
+    /// file, or carried onto a scrub by a time link is a sample of nothing.
+    /// Left readable it was the instant every layer with a past was asked
+    /// about — mesoscale discussions from the archive, alerts filtered to the
+    /// ones in force then — under a Live button painted live (report,
+    /// 2026-09-12).
+    ///
+    /// **Ownership is the loop's lineage, not a timeline's.** A re-arm (a
+    /// lookback change, a re-init) replaces the transport's timeline and keeps
+    /// the loop, and a restore brings a paused loop back before it can arm, so
+    /// the frame a user paused on is still that loop's playhead through both —
+    /// reopen is exactly 1:1. A new loop gets a new lineage
+    /// ([`Self::begin_or_continue_loop`]), so a clock an ended loop left never
+    /// passes for the new loop's playhead, and **no lineage owns nothing**.
+    ///
+    /// **Held here because no writer can hold it.** A loop ends through
+    /// [`Self::stop_every_layer_loop`], through direct resets of its
+    /// [`LayerTimeState`] wherever a listing comes back empty or refused, and
+    /// through a transport retarget or a layer's removal; this read answers all
+    /// of them without any of them cooperating. The one writer it does need is
+    /// the flag's: [`Self::set_viewing_live`] writes the depicted clock down
+    /// before clearing it, so no path that clears the flag resurrects a clock
+    /// this read declared dead.
+    ///
+    /// A pane the user parked (`viewing_live == false`) depicts exactly what
+    /// was written.
+    pub fn time_mode(&self) -> TimeMode {
+        match self.time.mode {
+            TimeMode::AsOf(_) if self.viewing_live && !self.clock_belongs_to_the_loop() => {
+                TimeMode::Live
+            }
+            mode => mode,
+        }
+    }
+
+    /// Whether the stored clock is the playhead of the loop this pane is
+    /// running, or waiting to re-arm. The cheap terms first: most panes answer
+    /// on the lineage compare and never ask the stack anything.
+    fn clock_belongs_to_the_loop(&self) -> bool {
+        self.time.owner.is_some()
+            && self.time.owner == self.loop_lineage
+            && (self.loop_arm_pending.is_some() || self.transport_is_active())
+    }
+
+    /// **Whether this pane's transport layer has a timeline running**, through
+    /// [`Self::transport_hint`] rather than [`Self::transport_state`].
+    ///
+    /// [`Self::time_mode`] is read by the layer walk once per layer per frame
+    /// (`PaneView::layer`, the cache token's as-of term), and a transport lookup
+    /// through the slot stack's resolver between two per-layer lookups would
+    /// replace its one-entry memo every time. The hint is one index and one id
+    /// compare when it is right, and a plain scan that repairs it when a slot
+    /// has moved; it never touches the resolver.
+    fn transport_is_active(&self) -> bool {
+        let slots: &[LayerSlot] = &self.layers;
+        let hint = self.transport_hint.get();
+        if let Some(slot) = slots.get(hint)
+            && slot.id == self.transport
+        {
+            return slot.time.is_active();
+        }
+        match slots.iter().position(|slot| slot.id == self.transport) {
+            Some(at) => {
+                self.transport_hint.set(at);
+                slots[at].time.is_active()
+            }
+            None => false,
+        }
+    }
+
+    /// **Whether this pane's selection follows live data** — see the field.
+    pub fn viewing_live(&self) -> bool {
+        self.viewing_live
+    }
+
+    /// **Set whether this pane's selection follows live data** — the one
+    /// writer of the flag.
+    ///
+    /// **Clearing it first writes down what the pane depicts.** While the flag
+    /// is set, [`Self::time_mode`] may be answering now over a stored clock no
+    /// loop owns, and clearing the flag is what makes a stored clock readable
+    /// as a park. Every writer that cleared it without moving the clock — a
+    /// time link carrying a neighbour's step, the Back button before its
+    /// navigation lands, the Set Time dialog's OK — put the pane straight back
+    /// on the dead instant and asked every layer with a past about it again.
+    /// A clock the loop owns is written back as itself.
+    ///
+    /// Setting the flag writes nothing: the read applies the rule from then on.
+    /// Either way, a change in what the pane depicts settles its playheads.
+    pub fn set_viewing_live(&mut self, live: bool) {
+        let before = self.time_mode();
+        if self.viewing_live && !live && before != self.time.mode {
+            self.time.mode = before;
+            self.time.owner = None;
+        }
+        self.viewing_live = live;
+        if self.time_mode() != before {
+            self.settle_playheads();
+        }
+    }
+
     /// Move this pane's clock, and settle every layer onto it.
+    ///
+    /// **A clock written while this pane's transport runs a loop is that
+    /// loop's playhead** — playback's tick, the transport's step and seek, a
+    /// forecast loop parking where it starts — and stays the loop's across a
+    /// re-arm, until the loop ends (see [`Self::time_mode`]). Any other write
+    /// belongs to no loop.
     pub fn set_time_mode(&mut self, mode: TimeMode) {
         self.time.mode = mode;
+        self.time.owner = if self.transport_is_active() {
+            self.loop_lineage
+        } else {
+            None
+        };
+        self.settle_playheads();
+    }
+
+    /// **Arm this pane's loop: continue the one it has, or begin a new one.**
+    ///
+    /// The app's one loop door (`App::handle_enable_loop`) calls this before it
+    /// consumes the pane's parked wish or writes any timeline. A loop is
+    /// *continued* when this pane is already running one — a lookback change, a
+    /// re-init — or is waiting to re-arm one — a restore, a transport that was
+    /// not ready: its lineage is kept, so a clock that loop wrote, such as the
+    /// frame a user paused on, is still the loop's once it re-arms. Anything
+    /// else is a new loop with a new lineage, so a clock an ended loop left is
+    /// never taken for the new loop's playhead.
+    pub fn begin_or_continue_loop(&mut self) {
+        let continuing = self.loop_arm_pending.is_some() || self.transport_is_active();
+        if !continuing || self.loop_lineage.is_none() {
+            self.loop_lineage = Some(next_loop_lineage());
+        }
+    }
+
+    /// **Restore this pane's clock from a config file.** Called after the live
+    /// flag and the loop wish have been restored, because both decide it.
+    ///
+    /// - A pane following live data whose loop was **paused** was left on the
+    ///   frame the user chose, and reopen is exactly 1:1: the clock is the
+    ///   restored loop's playhead, and stays it once the loop re-arms.
+    /// - A **playing** loop's clock is only the frame that happened to be up
+    ///   when the file was written — the next tick would have replaced it. It
+    ///   is not the loop's: the pane depicts now and the loop re-arms over the
+    ///   live window, instead of anchoring its listing on an archive seek to
+    ///   that sample, which reopened a playing loop hours in the past with every
+    ///   layer asked about then (report, 2026-09-12).
+    /// - A clock under a live flag with no loop is left over from a loop that
+    ///   ended, and depicts now; a pane the user parked depicts its instant.
+    pub fn restore_time_mode(&mut self, mode: TimeMode) {
+        let paused_on_a_frame = self.viewing_live
+            && mode.as_of().is_some()
+            && self.loop_arm_pending.is_some_and(|arm| !arm.playing);
+        self.time.mode = mode;
+        self.time.owner = None;
+        if paused_on_a_frame {
+            let lineage = next_loop_lineage();
+            self.loop_lineage = Some(lineage);
+            self.time.owner = Some(lineage);
+        }
         self.settle_playheads();
     }
 
@@ -3607,7 +3806,7 @@ impl PaneState {
             }
         }
         // Read before the slot borrow, which takes `self` mutably.
-        let as_of = self.time.mode.as_of();
+        let as_of = self.time_mode().as_of();
         let Some(slot) = self.slot_mut(id) else {
             // Unreachable through `add_layer` above, which only declines an id
             // no handler serves — and this pane holds no slot for one of those
@@ -4446,6 +4645,16 @@ mod volume_due_tests;
 /// Which layer the loop transport addresses, and what a config says about it.
 #[cfg(test)]
 mod transport_addressing_tests;
+
+/// A pane flagged live depicts now unless its running loop wrote the clock —
+/// every entry into the stale-clock state, asked of `PaneState::time_mode`.
+#[cfg(test)]
+mod live_clock_tests;
+
+/// The clock read adds no resolver work to the layer walk, counted by
+/// `slot_ledger`.
+#[cfg(test)]
+mod clock_read_memo_tests;
 
 /// What "which of my layers can loop" pays to resolve each layer's handler.
 #[cfg(test)]

@@ -191,6 +191,8 @@ fn satellite_loop_with_lightning() -> crate::app::App {
 
     let pane = app.gui.pane_mut(0).expect("the fixture built a pane");
     pane.set_transport_layer(known::GMGSI);
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     *pane.time_state_mut(&known::GMGSI) = squallar_egui::pane::LayerTimeState::begin(
         (window().1 - window().0).num_seconds() as u64,
         squallar_radar::types::RenderView::PlanView,

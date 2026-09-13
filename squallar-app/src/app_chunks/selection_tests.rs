@@ -17,7 +17,7 @@ pub(super) fn show_on(
 ) {
     let pane = app.gui.pane_mut(idx).unwrap();
     pane.set_site("KTLX".to_string());
-    pane.viewing_live = true;
+    pane.set_viewing_live(true);
     pane.set_selected_product(squallar_radar::fields::spec(product).id.clone());
     pane.set_selected_elevation(selected);
     let mut product_elevations = std::collections::HashMap::new();

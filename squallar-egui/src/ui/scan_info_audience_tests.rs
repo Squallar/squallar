@@ -180,7 +180,7 @@ fn the_site_wide_event_still_reaches_every_pane_on_the_site() {
 fn the_live_event_reaches_the_following_panes_and_only_them() {
     let mut gui = gui_on(["KTLX", "KTLX", "KTLX"]);
     gui.pane_mut(1).expect("pane 1").time_link = false;
-    gui.pane_mut(2).expect("pane 2").viewing_live = false;
+    gui.pane_mut(2).expect("pane 2").set_viewing_live(false);
 
     gui.apply(crate::shell_api::GuiEvent::LiveScanInfoForSite {
         site: "KTLX".to_owned(),
@@ -209,7 +209,7 @@ fn the_live_event_reaches_the_following_panes_and_only_them() {
 #[test]
 fn the_mid_volume_merge_skips_a_pane_parked_in_the_archive() {
     let mut gui = gui_on(["KTLX", "KTLX", "KTLX"]);
-    gui.pane_mut(2).expect("pane 2").viewing_live = false;
+    gui.pane_mut(2).expect("pane 2").set_viewing_live(false);
 
     gui.apply(crate::shell_api::GuiEvent::ChunkScanInfo {
         site: "KTLX".to_owned(),

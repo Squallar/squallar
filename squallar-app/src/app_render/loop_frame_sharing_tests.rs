@@ -43,10 +43,10 @@ fn two_unlinked_panes(stamps: &[chrono::NaiveDateTime]) -> crate::app::App {
             .cache_scan(SITE, stamp, volume_with_sweeps(&[TILT]));
     }
     for idx in 0..2 {
-        *app.gui
-            .pane_mut(idx)
-            .expect("the fixture built two panes")
-            .time_state_mut(&known::RADAR) = active_loop(stamps);
+        let pane = app.gui.pane_mut(idx).expect("the fixture built two panes");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
+        *pane.time_state_mut(&known::RADAR) = active_loop(stamps);
     }
     app
 }
@@ -252,7 +252,7 @@ fn a_pane_scrubbing_away_cannot_evict_the_frame_another_pane_shows() {
     }
     for (pane, frame) in [(0usize, 3usize), (1, 9)] {
         let pane = app.gui.pane_mut(pane).expect("the fixture built two panes");
-        pane.time.mode = TimeMode::AsOf(at(frame as i64));
+        pane.set_time_mode(TimeMode::AsOf(at(frame as i64)));
         pane.time_state_mut(&known::RADAR)
             .settle_playhead(TimeMode::AsOf(at(frame as i64)));
     }
@@ -547,8 +547,7 @@ fn two_panes_on_one_picture_set_price_one_loop_and_two_sets_price_two() {
     app.gui
         .pane_mut(1)
         .expect("the fixture built two panes")
-        .time
-        .mode = TimeMode::AsOf(at(-30));
+        .set_time_mode(TimeMode::AsOf(at(-30)));
     assert_eq!(
         app.loop_demand().demand.shares(),
         2,

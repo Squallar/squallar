@@ -38,7 +38,7 @@ fn event_lifetime_layers(gui: &Gui) -> Vec<LayerId> {
 #[test]
 fn a_live_panes_cache_token_is_untouched_by_the_as_of_term() {
     let mut gui = Gui::new();
-    gui.panes[0].time.mode = TimeMode::Live;
+    gui.panes[0].set_time_mode(TimeMode::Live);
 
     let ids: Vec<LayerId> = gui.overlays.handlers().map(|h| h.id()).collect();
     assert_eq!(ids.len(), 18, "the walk below must cover every layer",);
@@ -120,12 +120,14 @@ fn scrubbing_moves_the_token_of_exactly_the_as_of_dependent_layers() {
     let mut gui = Gui::new();
     let ids: Vec<LayerId> = gui.overlays.handlers().map(|h| h.id()).collect();
     let event = event_lifetime_layers(&gui);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.panes[0].set_viewing_live(false);
 
-    gui.panes[0].time.mode = TimeMode::Live;
+    gui.panes[0].set_time_mode(TimeMode::Live);
     let live: Vec<u64> = ids.iter().map(|id| token(&gui, id)).collect();
 
     // Far enough back that every quantum has moved on.
-    gui.panes[0].time.mode = TimeMode::AsOf(ts(20));
+    gui.panes[0].set_time_mode(TimeMode::AsOf(ts(20)));
     let scrubbed: Vec<u64> = ids.iter().map(|id| token(&gui, id)).collect();
 
     let mut moved = 0;
@@ -192,11 +194,13 @@ fn two_instants_in_one_quantum_share_a_texture_and_the_next_one_does_not() {
         "precondition: and 12:11:00 is the next one",
     );
 
-    gui.panes[0].time.mode = TimeMode::AsOf(base);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.panes[0].set_viewing_live(false);
+    gui.panes[0].set_time_mode(TimeMode::AsOf(base));
     let at_base = token(&gui, &alerts);
-    gui.panes[0].time.mode = TimeMode::AsOf(same_bucket);
+    gui.panes[0].set_time_mode(TimeMode::AsOf(same_bucket));
     let within = token(&gui, &alerts);
-    gui.panes[0].time.mode = TimeMode::AsOf(next_bucket);
+    gui.panes[0].set_time_mode(TimeMode::AsOf(next_bucket));
     let beyond = token(&gui, &alerts);
 
     assert_eq!(
@@ -221,6 +225,8 @@ fn two_instants_in_one_quantum_share_a_texture_and_the_next_one_does_not() {
 #[test]
 fn each_layer_buckets_the_clock_at_its_own_quantum() {
     let mut gui = Gui::new();
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.panes[0].set_viewing_live(false);
     let lightning = known::LIGHTNING;
     let alerts = known::NWS_ALERTS;
 
@@ -231,7 +237,7 @@ fn each_layer_buckets_the_clock_at_its_own_quantum() {
     let a_minute_on = base + chrono::Duration::seconds(60);
 
     let at = |gui: &mut Gui, instant, id: &LayerId| {
-        gui.panes[0].time.mode = TimeMode::AsOf(instant);
+        gui.panes[0].set_time_mode(TimeMode::AsOf(instant));
         token(gui, id)
     };
 

@@ -8,6 +8,12 @@ use squallar_kv::MemoryKvStore;
 /// back to a storm came back on live data with nothing said about it. That is
 /// the one piece of pane state a scrub exists to produce, and losing it is
 /// exactly what "reopen is exactly 1:1" forbids.
+///
+/// **The park clears `viewing_live`**, as every scrub, step and Set Time does.
+/// This fixture used to leave the pane flagged live over the parked clock,
+/// which is not a park: it is the stale-clock state that showed discussions and
+/// alerts from hours before under a Live button painted live (report,
+/// 2026-09-12), and `PaneState::time_mode` now depicts it as now.
 #[test]
 fn a_parked_pane_round_trips_its_instant() {
     let at = chrono::NaiveDate::from_ymd_opt(2013, 5, 20)
@@ -17,13 +23,14 @@ fn a_parked_pane_round_trips_its_instant() {
 
     let store = MemoryKvStore::default();
     let mut gui = Gui::new();
-    gui.panes[0].time.mode = crate::pane::TimeMode::AsOf(at);
+    gui.panes[0].set_viewing_live(false);
+    gui.panes[0].set_time_mode(crate::pane::TimeMode::AsOf(at));
     gui.save_ui_config(&store);
 
     let mut restored = Gui::new();
     restored.load_ui_config(&store);
     assert_eq!(
-        restored.panes[0].time.mode,
+        restored.panes[0].time_mode(),
         crate::pane::TimeMode::AsOf(at),
         "the parked instant must come back exactly, to the second"
     );
@@ -38,7 +45,7 @@ fn a_parked_pane_round_trips_its_instant() {
 fn a_live_pane_writes_nothing_and_comes_back_live() {
     let store = MemoryKvStore::default();
     let mut gui = Gui::new();
-    gui.panes[0].time.mode = crate::pane::TimeMode::Live;
+    gui.panes[0].set_time_mode(crate::pane::TimeMode::Live);
     gui.save_ui_config(&store);
 
     let json = gui.ui_config_json().expect("serialises");
@@ -49,7 +56,7 @@ fn a_live_pane_writes_nothing_and_comes_back_live() {
 
     let mut restored = Gui::new();
     restored.load_ui_config(&store);
-    assert_eq!(restored.panes[0].time.mode, crate::pane::TimeMode::Live);
+    assert_eq!(restored.panes[0].time_mode(), crate::pane::TimeMode::Live);
 }
 
 /// A config written before the field loads live, which is how those sessions
@@ -123,9 +130,19 @@ fn the_written_spelling_parses_back() {
 /// in the log directly above the one that replaced it.
 ///
 /// **Non-vacuity floor**: the live pane in the same table must come back live, so
-/// "always false" does not pass; and the fourth row pins the case that forbids
-/// deriving this from `as_of` — a pane playing a loop depicts an older instant
-/// while still following the live site.
+/// "always false" does not pass; and
+/// [`a_file_with_a_live_flag_and_a_parked_clock_loads_live_and_depicts_now`]
+/// pins the case that forbids deriving this from `as_of`, against a file that
+/// really carries one.
+///
+/// **The third row used to expect the parked clock back, and that pinned the
+/// defect.** It was named "looping while still live" but armed no loop: a live
+/// flag over a clock nothing is moving is exactly the state that reopened with
+/// discussions and alerts from hours before (report, 2026-09-12). A live pane
+/// depicts a stored instant only while it is its loop's playhead — a loop
+/// running, or one restored paused and waiting to re-arm, which reopens on the
+/// frame the user chose (`PaneState::restore_time_mode`) — and this row
+/// restores no loop. It keeps the flag and expects the pane to depict now.
 #[test]
 fn viewing_live_round_trips_independently_of_the_clock() {
     let at = chrono::NaiveDate::from_ymd_opt(2022, 9, 28)
@@ -133,21 +150,29 @@ fn viewing_live_round_trips_independently_of_the_clock() {
         .and_hms_opt(19, 30, 0)
         .unwrap();
 
-    for (mode, live, why) in [
+    for (mode, live, depicted, why) in [
         (
             crate::pane::TimeMode::AsOf(at),
             false,
+            crate::pane::TimeMode::AsOf(at),
             "scrubbed to an instant",
         ),
-        (crate::pane::TimeMode::Live, true, "following live data"),
+        (
+            crate::pane::TimeMode::Live,
+            true,
+            crate::pane::TimeMode::Live,
+            "following live data",
+        ),
         (
             crate::pane::TimeMode::AsOf(at),
             true,
-            "looping while still live",
+            crate::pane::TimeMode::Live,
+            "a live flag over a clock no running loop wrote",
         ),
         (
             crate::pane::TimeMode::Live,
             false,
+            crate::pane::TimeMode::Live,
             "live clock, selection detached",
         ),
     ] {
@@ -155,15 +180,56 @@ fn viewing_live_round_trips_independently_of_the_clock() {
         let mut gui = Gui::new();
         {
             let pane = gui.pane_mut(0).expect("pane 0");
-            pane.time.mode = mode;
-            pane.viewing_live = live;
+            // The flag first, as every park does: a clock written under a live
+            // flag with no loop is one the pane does not depict.
+            pane.set_viewing_live(live);
+            pane.set_time_mode(mode);
         }
         gui.save_ui_config(&store);
 
         let mut restored = Gui::new();
         restored.load_ui_config(&store);
         let pane = restored.pane(0).expect("pane 0");
-        assert_eq!(pane.viewing_live, live, "viewing_live must survive: {why}");
-        assert_eq!(pane.time.mode, mode, "the clock must survive too: {why}");
+        assert_eq!(
+            pane.viewing_live(),
+            live,
+            "viewing_live must survive: {why}"
+        );
+        assert_eq!(
+            pane.time_mode(),
+            depicted,
+            "the pane must depict {depicted:?}: {why}"
+        );
     }
+}
+
+/// **A file with a live flag and a parked clock loads live, and depicts now.**
+///
+/// The file the deployed build writes for a live pane whose loop was switched
+/// off before closing: `as_of` present, `viewing_live` absent. Two claims, one
+/// file:
+///
+/// - `viewing_live` is **not derived from `as_of`** — deriving it would read
+///   this pane as parked and stop its chunk feed. It must come back `true`.
+/// - the pane **depicts now** — the parked clock is left over from a loop that
+///   no longer exists, and depicting it is what showed discussions and alerts
+///   from hours before (report, 2026-09-12).
+#[test]
+fn a_file_with_a_live_flag_and_a_parked_clock_loads_live_and_depicts_now() {
+    let json = r#"{"pane_count":1,"panes":[{"as_of":"2022-09-28T19:30:00","time_step_secs":600}]}"#;
+    let store = MemoryKvStore::default();
+    squallar_kv::KvStore::store(&store, crate::UI_CONFIG_KEY, json).expect("stores");
+
+    let mut restored = Gui::new();
+    assert!(restored.load_ui_config(&store), "premise: the file loads");
+    let pane = restored.pane(0).expect("pane 0");
+    assert!(
+        pane.viewing_live(),
+        "viewing_live must not be derived from the parked clock"
+    );
+    assert_eq!(
+        pane.time_mode(),
+        crate::pane::TimeMode::Live,
+        "a live flag over a clock no running loop wrote must depict now"
+    );
 }

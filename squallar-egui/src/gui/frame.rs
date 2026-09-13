@@ -1038,8 +1038,7 @@ fn round_ask(
             overlays.serialize_pane_state(kind, state as &dyn std::any::Any)
         });
     let depicted = pane
-        .time
-        .mode
+        .time_mode()
         .as_of()
         .filter(|_| depicted_matters)
         .map(|instant| {

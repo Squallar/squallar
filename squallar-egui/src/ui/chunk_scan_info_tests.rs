@@ -268,10 +268,10 @@ fn live_sites_are_distinct_and_exclude_historic_panes() {
     for (idx, site) in ["KTLX", "KTLX", "KOUN"].iter().enumerate() {
         let pane = gui.pane_mut(idx).unwrap();
         pane.set_site((*site).to_string());
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
     }
     assert_eq!(gui.live_sites(), vec!["KTLX", "KOUN"]);
 
-    gui.pane_mut(2).unwrap().viewing_live = false;
+    gui.pane_mut(2).unwrap().set_viewing_live(false);
     assert_eq!(gui.live_sites(), vec!["KTLX"]);
 }

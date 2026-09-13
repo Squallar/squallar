@@ -2003,6 +2003,11 @@ impl super::App {
         // not-ready arm re-parks it. Cleared here rather than arm by arm so
         // no path can leave a spent request behind for a second acting.
         if let Some(pane) = panes.get_mut(pane_idx) {
+            // Before the wish is consumed: whether this arm continues the
+            // pane's loop (a re-arm, a restore) or begins a new one is read off
+            // the wish and the running transport, and it decides whether the
+            // clock that loop wrote — a paused frame — is still its playhead.
+            pane.begin_or_continue_loop();
             pane.loop_arm_pending = None;
         }
         let dispatch = begin_loop_for_pane(
@@ -3157,7 +3162,7 @@ fn nav_instant(pane: &squallar_egui::pane::PaneState, now: NaiveDateTime) -> Nai
         .as_ref()
         .map(|info| info.timestamp)
         .or_else(|| pane.data_time_on_screen())
-        .or_else(|| pane.time.mode.as_of())
+        .or_else(|| pane.time_mode().as_of())
         .unwrap_or(now)
 }
 
@@ -3291,7 +3296,7 @@ pub(super) fn sounding_span_for_site(
 ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
     let mut span: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> = None;
     for pane in panes.iter().filter(|p| p.is_map() && p.site() == site) {
-        let end = pane.time.mode.as_of().map_or(now, |t| t.and_utc());
+        let end = pane.time_mode().as_of().map_or(now, |t| t.and_utc());
         // `PaneState::loop_span_secs` is this raised to the transport's floor,
         // and for radar that floor is 0 — so the lookback alone is the span here
         // and the overlay registry does not need to be borrowed to ask.
@@ -4022,7 +4027,7 @@ fn append_polled_frame_to_loops(
         pane.hydrate_layer_states(overlays, pane_idx);
         // Read before any timeline is borrowed mutably: the window this append
         // evicts against is the pane's clock, not the layer's.
-        let clock = pane.time.mode;
+        let clock = pane.time_mode();
         for layer in &layers {
             let plan = {
                 let view = pane.view(pane_idx);
@@ -4247,7 +4252,7 @@ fn as_of_for_layer(
     let Some(pane) = gui.pane(pane_idx) else {
         return fallback;
     };
-    let Some(instant) = pane.time.mode.as_of() else {
+    let Some(instant) = pane.time_mode().as_of() else {
         return fallback;
     };
     let has_a_past = gui.overlays.handler_by_id(id).is_some_and(|handler| {
@@ -4301,7 +4306,7 @@ pub(super) fn fetch_config_for_layer(
 /// posture is the reach — a parked scrub, where the slider genuinely is the
 /// answer.
 fn depicted_stops(pane: &squallar_egui::pane::PaneState) -> Vec<chrono::NaiveDateTime> {
-    let Some(instant) = pane.time.mode.as_of() else {
+    let Some(instant) = pane.time_mode().as_of() else {
         return Vec::new();
     };
     let ls = pane.transport_state();
@@ -4396,7 +4401,7 @@ fn depicted_frames_for_layer(
     let Some(pane) = gui.pane(pane_idx) else {
         return Vec::new();
     };
-    if pane.time.mode.as_of().is_none() {
+    if pane.time_mode().as_of().is_none() {
         return Vec::new();
     }
     let event_lifetime = gui.overlays.handler_by_id(id).is_some_and(|handler| {

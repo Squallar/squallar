@@ -66,7 +66,7 @@ fn shown(app: &crate::app::App) -> Option<chrono::NaiveDateTime> {
 /// readers key on the mode rather than on the frame it resolves to — see
 /// `loop_start_frame`.
 fn clock(app: &crate::app::App) -> TimeMode {
-    app.gui.pane(0).expect("pane 0").time.mode
+    app.gui.pane(0).expect("pane 0").time_mode()
 }
 
 /// One tick of playback with the frame interval already elapsed.
@@ -463,6 +463,8 @@ fn the_tick_sequence_of_a_radar_only_pane_is_unchanged() {
     let (mut app, _asked) = app_with_frames(Vec::new());
     {
         let pane = app.gui.pane_mut(0).expect("pane 0");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let ls = pane.transport_state_mut();
         *ls = LayerTimeState::begin(
             3600,
@@ -520,7 +522,12 @@ fn arming_a_loop_leaves_a_parked_pane_on_its_instant() {
         ),
     ] {
         let mut gui = squallar_egui::Gui::new();
-        gui.pane_mut(0).expect("pane 0").time.mode = start_mode;
+        // The parked row is a pane the user scrubbed, and a scrub clears the
+        // live flag; the live row stays live.
+        gui.pane_mut(0)
+            .expect("pane 0")
+            .set_viewing_live(start_mode.as_of().is_none());
+        gui.pane_mut(0).expect("pane 0").set_time_mode(start_mode);
 
         // The arm the fix guards: `park` is `None` for a radar transport.
         let pane = gui.pane_mut(0).expect("pane 0");
@@ -528,12 +535,13 @@ fn arming_a_loop_leaves_a_parked_pane_on_its_instant() {
             Some(index) => {
                 pane.park_on_transport_frame(index);
             }
-            None if pane.time.mode.as_of().is_some() => pane.settle_playheads(),
+            None if pane.time_mode().as_of().is_some() => pane.settle_playheads(),
             None => pane.set_time_mode(squallar_egui::pane::TimeMode::Live),
         }
 
         assert_eq!(
-            pane.time.mode, expected,
+            pane.time_mode(),
+            expected,
             "starting from {start_mode:?} the loop-arm must leave the clock at {expected:?}"
         );
     }

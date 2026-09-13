@@ -31,7 +31,10 @@ fn toggle(gui: &mut Gui, id: &LayerId, on: bool) {
 /// Give `id`'s slot on pane 0 a timeline that is genuinely running, so the
 /// state it answers with is distinguishable from any other layer's.
 fn animate(gui: &mut Gui, id: &LayerId, phase: LoopPhase, span_secs: u64) {
-    let state = gui.pane_mut(0).expect("pane 0").time_state_mut(id);
+    let pane = gui.pane_mut(0).expect("pane 0");
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
+    let state = pane.time_state_mut(id);
     state.phase = phase;
     state.span_secs = span_secs;
 }
@@ -138,7 +141,7 @@ fn parking_on_a_transport_frame_takes_the_transport_layers_stamp() {
     assert!(pane.park_on_transport_frame(1));
 
     assert_eq!(
-        pane.time.mode,
+        pane.time_mode(),
         TimeMode::AsOf(
             chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
                 .unwrap()

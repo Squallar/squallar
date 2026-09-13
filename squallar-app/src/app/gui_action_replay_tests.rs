@@ -30,7 +30,7 @@ fn a_scripted_action_batch_lands_through_the_seam() {
         "precondition: the seeded fix reached the UI through the compose"
     );
     assert!(
-        app.gui.pane(0).is_some_and(|p| p.viewing_live),
+        app.gui.pane(0).is_some_and(|p| p.viewing_live()),
         "precondition: panes start live"
     );
 
@@ -48,11 +48,11 @@ fn a_scripted_action_batch_lands_through_the_seam() {
     ]);
 
     assert!(
-        !app.gui.pane(0).is_some_and(|p| p.viewing_live),
+        !app.gui.pane(0).is_some_and(|p| p.viewing_live()),
         "NavigateTime did not take pane 0 off live through the seam"
     );
     assert!(
-        app.gui.pane(1).is_some_and(|p| p.viewing_live),
+        app.gui.pane(1).is_some_and(|p| p.viewing_live()),
         "JumpToLive did not return pane 1 to live through the seam"
     );
     assert!(
@@ -111,7 +111,7 @@ fn a_forward_step_past_now_is_live_only_on_a_transport_that_ends_at_now() {
         step_secs: 12 * 3600,
     }]);
     assert!(
-        app.gui.pane(0).is_some_and(|p| p.viewing_live),
+        app.gui.pane(0).is_some_and(|p| p.viewing_live()),
         "a radar pane stepped past now must clamp back to live, exactly as \
          it always did"
     );
@@ -122,7 +122,7 @@ fn a_forward_step_past_now_is_live_only_on_a_transport_that_ends_at_now() {
         step_secs: 12 * 3600,
     }]);
     assert!(
-        !app.gui.pane(1).is_some_and(|p| p.viewing_live),
+        !app.gui.pane(1).is_some_and(|p| p.viewing_live()),
         "stepping onto a forecast instant reported the pane live: a pane \
          depicting twelve hours from now is not depicting now"
     );

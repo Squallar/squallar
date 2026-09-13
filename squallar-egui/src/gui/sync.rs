@@ -242,13 +242,13 @@ impl Gui {
             return;
         }
         let group = src.group;
-        let active_viewing_live = src.viewing_live;
+        let active_viewing_live = src.viewing_live();
         let active_time_step = src.time.step;
         for (idx, p) in self.panes.iter_mut().enumerate() {
             if idx == self.active_pane || !p.time_link || p.group != group {
                 continue;
             }
-            p.viewing_live = active_viewing_live;
+            p.set_viewing_live(active_viewing_live);
             p.time.step = active_time_step;
         }
     }

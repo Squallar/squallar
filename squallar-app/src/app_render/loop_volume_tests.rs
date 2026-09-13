@@ -58,6 +58,8 @@ fn app_with_volume_loop(minutes: &[u32]) -> crate::app::App {
     pane.set_selected_product(PRODUCT_ID);
     pane.set_selected_elevation(TILT);
     pane.set_view(squallar_radar::types::RenderView::Volume);
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
 
     let mut ls = squallar_egui::radar_layer::begin_loop(3600, &site(), RenderView::Volume);
     ls.phase = LoopPhase::Rendering;

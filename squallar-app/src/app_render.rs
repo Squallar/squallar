@@ -7297,7 +7297,7 @@ impl super::App {
                 // parked radar pane whose loop armed was dragged to live data
                 // the moment it armed. That is how a screenshot pinned to the
                 // 2013 Moore volume came back showing this afternoon's weather.
-                None if pane.time.mode.as_of().is_some() => pane.settle_playheads(),
+                None if pane.time_mode().as_of().is_some() => pane.settle_playheads(),
                 None => pane.set_time_mode(squallar_egui::pane::TimeMode::Live),
             }
         }
@@ -7315,7 +7315,7 @@ impl super::App {
             // The pane's own posture, which every pane carries the same copy
             // of — see `Gui::set_loop_speed_fps`.
             let interval = loop_interval(pane.time.speed_fps);
-            let mode = pane.time.mode;
+            let mode = pane.time_mode();
             // **The pane's decision, not a derivation off what happens to be
             // running.** This read `clock_layer()` — the topmost *active*
             // slot — every tick, so the layer whose stamps the clock walked
@@ -9225,7 +9225,7 @@ impl super::App {
                 pane.hydrate_layer_states(overlays, pane_idx);
                 // Read before any timeline is borrowed mutably: a re-sampled
                 // list is settled onto the pane's own clock.
-                let clock = pane.time.mode;
+                let clock = pane.time_mode();
                 for id in ids {
                     if !overlays
                         .render_mode(&id)
@@ -9600,7 +9600,7 @@ impl super::App {
             // layer the user switched off beside it, which would otherwise go
             // on halving radar's own frame list.
             let animating = pane.animating_drawn_layers().count();
-            let clock = pane.time.mode;
+            let clock = pane.time_mode();
             let ls = pane.time_state_mut(&known::RADAR);
             if !ls.is_active() {
                 retire_queues.push(pane_idx);
@@ -10390,7 +10390,7 @@ impl LoopIdentity {
                     .map(|target| squallar_egui::pane::elevation_tenths(target.elevation)),
                 section: ls.section_key().cloned(),
                 span_secs: pane.time.span_secs,
-                mode: pane.time.mode,
+                mode: pane.time_mode(),
             },
         }
     }
@@ -12031,6 +12031,13 @@ mod loop_frame_sharing_tests;
 #[path = "app_render/loop_playback_transport_tests.rs"]
 #[cfg(test)]
 mod loop_playback_transport_tests;
+
+/// A live pane whose playback stopped, or that reopened after closing on a
+/// playing loop, depicts now — the clock does not stay on the last frame's
+/// stamp under a Live button that ignores its click.
+#[path = "app_render/live_clock_restore_tests.rs"]
+#[cfg(test)]
+mod live_clock_restore_tests;
 
 /// The one EVENT count on the loop line: a playback tick that wanted a frame
 /// and did not get one, both arms, and the frame set it must never touch.

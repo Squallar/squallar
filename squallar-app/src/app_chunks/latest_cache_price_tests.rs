@@ -20,7 +20,7 @@ fn app_parked_on_site() -> App {
     let mut app = headless(TestBridge::desktop());
     let pane = app.gui.pane_mut(0).expect("a headless app has a pane");
     pane.set_site(SITE.to_string());
-    pane.viewing_live = false;
+    pane.set_viewing_live(false);
     app
 }
 

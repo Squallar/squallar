@@ -1752,9 +1752,9 @@ impl super::Gui {
                     layers: BTreeMap::new(),
                     spc_day: OutlookDay::Day1,
                     time_step_secs: pane.time.step.as_secs(),
-                    viewing_live: pane.viewing_live,
+                    viewing_live: pane.viewing_live(),
                     loop_playback: loop_playback_of(pane),
-                    as_of: match pane.time.mode {
+                    as_of: match pane.time_mode() {
                         crate::pane::TimeMode::Live => None,
                         crate::pane::TimeMode::AsOf(at) => {
                             Some(at.format(AS_OF_FORMAT).to_string())
@@ -2166,7 +2166,7 @@ impl super::Gui {
             pane.selected_site = pc.coverage_ring.then(|| pane.site().to_string());
             pane.hidden_color_bars = pc.hidden_color_bars.iter().map(LayerId::new).collect();
             pane.time.step = crate::pane::TimeStep::from_secs(pc.time_step_secs);
-            pane.viewing_live = pc.viewing_live;
+            pane.set_viewing_live(pc.viewing_live);
             // A request for the app to act on, not a state to assume: arming a
             // loop needs a listing dispatch this crate cannot make.
             pane.loop_arm_pending = loop_arm_from_config(pc.loop_playback.as_deref());
@@ -2178,7 +2178,13 @@ impl super::Gui {
             // including Radar, which fetches out of band and can only answer
             // "no fetch task could be built". The user saw that as an error
             // toast on a pane whose volume had loaded perfectly.
-            pane.set_time_mode(
+            //
+            // `restore_time_mode`, after the flag and the loop wish: a live
+            // pane paused on a frame gets that frame back as its loop's
+            // playhead (reopen is 1:1), and a clock no loop owns under a live
+            // flag -- a playing loop's passing frame, a loop that had ended --
+            // depicts now. See the method.
+            pane.restore_time_mode(
                 pc.as_of
                     .as_deref()
                     .and_then(parse_as_of)

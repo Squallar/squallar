@@ -50,7 +50,7 @@ fn app_showing(shown: chrono::NaiveDateTime) -> App {
     {
         let pane = app.gui.pane_mut(0).unwrap();
         pane.set_site("KTLX".to_string());
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
         pane.scan_info = Some(squallar_radar::types::ScanInfo {
             site_source: squallar_radar::site_position::SitePositionSource::Table,
             site_position: None,
@@ -615,7 +615,7 @@ fn every_archive_path_offers_its_volume_to_the_3d_pane() {
     );
 
     let mut historic = app_showing(at(10));
-    historic.gui.pane_mut(0).unwrap().viewing_live = false;
+    historic.gui.pane_mut(0).unwrap().set_viewing_live(false);
     send_auto_poll_archive(&historic, at(15));
     historic.poll_data_channels();
     assert!(
@@ -701,7 +701,7 @@ fn add_live_pane(app: &mut App, shown: chrono::NaiveDateTime) {
     std::mem::swap(&mut app.gui, &mut two.gui);
     for idx in [0, 1] {
         let pane = app.gui.pane_mut(idx).unwrap();
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
         pane.scan_info = Some(squallar_radar::types::ScanInfo {
             site_source: squallar_radar::site_position::SitePositionSource::Table,
             site_position: None,
@@ -825,7 +825,7 @@ fn an_auto_poll_result_stays_behind_the_guard_even_mid_navigation() {
 fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
     let mut app = app_showing(at(10));
     add_live_pane(&mut app, at(10));
-    app.gui.pane_mut(0).unwrap().viewing_live = false;
+    app.gui.pane_mut(0).unwrap().set_viewing_live(false);
     app.chunk_feeds.ensure("KTLX");
     assert!(app.chunks_are_feeding("KTLX"), "precondition: feed running");
     let generation = app.render.fetch_generation_for("KTLX");
@@ -836,7 +836,7 @@ fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
     );
 
     assert!(
-        app.gui.pane(0).unwrap().viewing_live,
+        app.gui.pane(0).unwrap().viewing_live(),
         "Live must reattach the pane to the feed"
     );
     assert_eq!(
@@ -859,7 +859,7 @@ fn jump_to_live_on_a_serving_feed_reattaches_without_a_fetch() {
 #[test]
 fn jump_to_live_with_the_feed_retired_still_fetches() {
     let mut app = app_showing(at(10));
-    app.gui.pane_mut(0).unwrap().viewing_live = false;
+    app.gui.pane_mut(0).unwrap().set_viewing_live(false);
     assert!(!app.chunks_are_feeding("KTLX"), "precondition: no feed");
     let generation = app.render.fetch_generation_for("KTLX");
 
@@ -868,7 +868,7 @@ fn jump_to_live_with_the_feed_retired_still_fetches() {
         None,
     );
 
-    assert!(app.gui.pane(0).unwrap().viewing_live);
+    assert!(app.gui.pane(0).unwrap().viewing_live());
     assert_eq!(
         app.render.fetch_generation_for("KTLX"),
         generation + 1,
@@ -895,7 +895,7 @@ fn navigate_time_steps_relative_to_the_panes_scan_and_parks_it() {
         None,
     );
 
-    assert!(!app.gui.pane(0).unwrap().viewing_live);
+    assert!(!app.gui.pane(0).unwrap().viewing_live());
     assert!(app.gui.fetching());
     assert!(app.manual_nav_pending);
     assert_eq!(app.render.fetch_generation_for("KTLX"), generation + 1);
@@ -965,7 +965,10 @@ fn the_loop_transport_payloads_drive_the_playback_state() {
                 render_failed: false,
             })
             .collect();
-        *app.gui.pane_mut(0).unwrap().time_state_mut(&known::RADAR) = state;
+        let pane = app.gui.pane_mut(0).unwrap();
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
+        *pane.time_state_mut(&known::RADAR) = state;
     }
     let phase = |app: &App| app.gui.pane(0).unwrap().time_state(&known::RADAR).phase;
     let frame = |app: &App| {

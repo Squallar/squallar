@@ -749,7 +749,7 @@ fn sweep_a_satellite_loop() -> Sweep {
         capture_uploads(&ctx, &mut uploads);
 
         let pane = app.gui.pane(0).expect("pane 0");
-        if let Some(stop) = pane.time.mode.as_of() {
+        if let Some(stop) = pane.time_mode().as_of() {
             // **Handle -> pixels, and nothing in between.** The handle alone
             // is upload identity, which every frame has by construction; what
             // is counted is the raster it carries, looked up by the very id

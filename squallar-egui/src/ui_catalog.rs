@@ -697,7 +697,7 @@ impl super::Gui {
                     .filter_map(|slot| slot.state.as_deref())
                     .map(|s| s as &dyn std::any::Any)
                     .collect();
-                let as_of = pane.time.mode.as_of();
+                let as_of = pane.time_mode().as_of();
                 let mut pane_ctx = PaneMut {
                     pane_idx: idx,
                     state: pane

@@ -32,7 +32,7 @@ fn app_on_site() -> App {
     let mut app = headless(TestBridge::desktop());
     let pane = app.gui.pane_mut(0).expect("a headless app has a pane");
     pane.set_site(SITE.to_string());
-    pane.viewing_live = true;
+    pane.set_viewing_live(true);
     app
 }
 
@@ -297,7 +297,7 @@ fn a_parked_volume_survives_the_loop_sweep_however_the_archive_keyed_it() {
 #[test]
 fn a_latest_that_is_the_merge_base_adds_nothing_to_the_still_level() {
     let mut app = app_on_site();
-    app.gui.pane_mut(0).expect("a pane").viewing_live = false;
+    app.gui.pane_mut(0).expect("a pane").set_viewing_live(false);
     land_one_auto_poll_volume(&mut app, SITE, at(0));
 
     let (latest, _, _, _) = app

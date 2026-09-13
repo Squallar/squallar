@@ -226,6 +226,8 @@ fn published_pane(
         run,
     })]);
     let mut pane = squallar_egui::pane::PaneState::with_site("KTLX".to_string());
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     let ls = pane.time_state_mut(&satellite());
     ls.phase = squallar_egui::pane::LoopPhase::Ready;
     ls.span_secs = WIDE;

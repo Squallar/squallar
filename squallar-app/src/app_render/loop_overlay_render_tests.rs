@@ -360,6 +360,8 @@ pub(super) fn build_loop(
     // suite asserts moved; what moved is the fixture saying which of the two
     // states it means.
     pane.set_overlay_enabled(known::MODEL_DATA, true);
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     *pane.time_state_mut(&known::MODEL_DATA) = squallar_egui::pane::LayerTimeState::begin(
         (range.1 - range.0).num_seconds() as u64,
         squallar_radar::types::RenderView::PlanView,

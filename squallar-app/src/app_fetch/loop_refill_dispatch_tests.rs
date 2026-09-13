@@ -197,6 +197,8 @@ fn app_looping(id: &LayerId, frames: &[i64]) -> (App, Ranges) {
     })]);
     let pane = app.gui.pane_mut(0).expect("the fixture has one pane");
     pane.set_transport_layer(id.clone());
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     let ls = pane.transport_state_mut();
     ls.phase = squallar_egui::pane::LoopPhase::Ready;
     ls.span_secs = SPAN;
@@ -242,7 +244,7 @@ fn a_pane_scrubbed_before_its_loop_window_asks_that_layer_for_that_instant() {
     let pane = app.gui.pane_mut(0).expect("one pane");
     pane.set_time_mode(squallar_egui::pane::TimeMode::AsOf(ts(30)));
     assert_eq!(
-        pane.transport_state().qualifying_frame_at(pane.time.mode),
+        pane.transport_state().qualifying_frame_at(pane.time_mode()),
         None,
         "premise: this is WI-3's blank - no frame this pane holds is valid at 12:30",
     );
@@ -521,6 +523,8 @@ fn a_deep_scrub_refills_every_animating_layer_not_just_the_transport() {
     {
         let pane = app.gui.pane_mut(0).expect("the fixture has one pane");
         pane.set_transport_layer(transport.clone());
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let ls = pane.time_state_mut(&transport);
         ls.phase = squallar_egui::pane::LoopPhase::Ready;
         ls.span_secs = SPAN;
@@ -532,7 +536,7 @@ fn a_deep_scrub_refills_every_animating_layer_not_just_the_transport() {
         pane.set_time_mode(squallar_egui::pane::TimeMode::AsOf(ts(30)));
         assert_eq!(
             pane.time_state(&secondary)
-                .qualifying_frame_at(pane.time.mode),
+                .qualifying_frame_at(pane.time_mode()),
             None,
             "premise: the secondary draws nothing at 12:30 either",
         );

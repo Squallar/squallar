@@ -446,7 +446,7 @@ impl super::App {
         (0..self.gui.pane_count()).any(|i| {
             self.gui
                 .pane(i)
-                .is_some_and(|p| p.site() == site && p.viewing_live)
+                .is_some_and(|p| p.site() == site && p.viewing_live())
         })
     }
 

@@ -4773,7 +4773,7 @@ fn back_steps_into_the_archive_and_forward_is_dead_while_live() {
     h.warm_up();
     let t = h.timeline();
     assert!(
-        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live(),
         "back must drop the pane out of live"
     );
     assert!(
@@ -4880,7 +4880,7 @@ fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
     assert!(
-        h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        h.gui_mut().pane(0).expect("pane 0").viewing_live(),
         "precondition: the pane starts live"
     );
 
@@ -4919,7 +4919,7 @@ fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
         "releasing the scrub mid-rail emitted no NavigateTime"
     );
     assert!(
-        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live(),
         "the committed scrub left the pane claiming to be live"
     );
 }
@@ -4940,7 +4940,10 @@ fn scrubbing_the_archive_commits_once_on_release_and_drops_live() {
 fn scrubbing_to_the_right_end_restores_live() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_viewing_live(false);
     h.warm_up();
 
     let scrub = h.timeline().scrubber;
@@ -6259,7 +6262,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
             .expect("a fresh harness has one pane");
         pane.set_selected_product(radar_fields::known::VELOCITY);
         pane.set_selected_elevation(1.5);
-        pane.viewing_live = false;
+        pane.set_viewing_live(false);
         let _ = pane.map_memory.set_zoom(9.25);
         pane.map_memory.center_at(walkers::lat_lon(35.0, -97.8));
     }
@@ -6283,7 +6286,7 @@ fn a_converted_pane_keeps_its_site_and_viewport() {
             pane.scan_info.as_ref().map(|info| info.site.name),
             crate::field_facts::name(&pane.selected_product()).to_owned(),
             pane.selected_elevation(),
-            pane.viewing_live,
+            pane.viewing_live(),
             pane.map_memory.zoom(),
             pane.map_memory.detached(),
         )
@@ -8674,18 +8677,18 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
 
     {
         let gui = h.gui_mut();
-        gui.pane_mut(1).expect("pane 1").viewing_live = false;
+        gui.pane_mut(1).expect("pane 1").set_viewing_live(false);
         gui.pane_mut(1).expect("pane 1").time.step = crate::pane::TimeStep::from_secs(0);
-        gui.pane_mut(2).expect("pane 2").viewing_live = false;
+        gui.pane_mut(2).expect("pane 2").set_viewing_live(false);
     }
     h.warm_up();
     let gui = h.gui_mut();
     assert!(
-        gui.pane(2).expect("pane 2").viewing_live,
+        gui.pane(2).expect("pane 2").viewing_live(),
         "the linked pane must be dragged back to the active pane's live state"
     );
     assert!(
-        !gui.pane(1).expect("pane 1").viewing_live,
+        !gui.pane(1).expect("pane 1").viewing_live(),
         "the unlinked pane must stay frozen"
     );
     assert_eq!(
@@ -8749,7 +8752,10 @@ fn an_unlinked_pane_is_excluded_from_shared_nav_and_loop_fan_out() {
 fn a_keyboard_nudge_on_the_archive_scrubber_commits() {
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     h.load_scan("KTLX");
-    h.gui_mut().pane_mut(0).expect("pane 0").viewing_live = false;
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_viewing_live(false);
     h.warm_up();
 
     let scrubber_id = h
@@ -10880,7 +10886,7 @@ fn the_live_chip_never_intersects_the_bar_items() {
     for width in [420.0, 330.0] {
         let mut h = InputHarness::with_screen(egui::vec2(width, 900.0));
         h.load_scan("KMKX");
-        h.gui_mut().active_pane_mut().viewing_live = false;
+        h.gui_mut().active_pane_mut().set_viewing_live(false);
         h.warm_up();
         let bar = h.bottom_bar();
         let (chip, _) = bar.live_chip;
@@ -12533,7 +12539,7 @@ fn the_time_chip_falls_back_to_a_map_panes_time_on_a_non_map_pane() {
     {
         let pane0 = h.gui_mut().pane_mut(0).expect("pane 0 exists");
         pane0.data_time = Some(t);
-        pane0.viewing_live = false;
+        pane0.set_viewing_live(false);
     }
     h.mouse_click(h.pane_rects()[1].center());
     h.warm_up();
@@ -13063,7 +13069,7 @@ fn the_transport_controls_emit_the_exact_payloads_the_frontend_acts_on() {
         "Back must step the active pane one default step into the archive"
     );
     assert!(
-        !h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        !h.gui_mut().pane(0).expect("pane 0").viewing_live(),
         "Back must park the pane out of live"
     );
     h.warm_up();
@@ -15322,7 +15328,7 @@ fn a_drag_crosses_the_colour_break_in_one_hit_target() {
             .any(|a| matches!(a, GuiAction::JumpToLive { .. })),
         "a release in the middle of the forecast region answered live"
     );
-    let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let mode = h.gui_mut().pane(0).expect("pane 0").time_mode();
     let crate::pane::TimeMode::AsOf(landed) = mode else {
         panic!("the release left the pane's clock at {mode:?}, not on the instant it named");
     };
@@ -15359,7 +15365,7 @@ fn a_drag_crosses_the_colour_break_in_one_hit_target() {
         "the drag out of the forecast region committed {} times, not once",
         navigations.len(),
     );
-    let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let mode = h.gui_mut().pane(0).expect("pane 0").time_mode();
     let crate::pane::TimeMode::AsOf(landed) = mode else {
         panic!("the return leg left the pane's clock at {mode:?}");
     };
@@ -15406,7 +15412,7 @@ fn the_live_zone_sits_at_now_and_not_at_the_far_end() {
         );
         // Non-vacuity: that release really did commit, so the negative above
         // is about where it landed and not about nothing having happened.
-        let mode = h.gui_mut().pane(0).expect("pane 0").time.mode;
+        let mode = h.gui_mut().pane(0).expect("pane 0").time_mode();
         let crate::pane::TimeMode::AsOf(landed) = mode else {
             panic!("travel {travel:.1} pt: the far end committed nothing at all");
         };
@@ -15447,11 +15453,11 @@ fn a_pane_with_no_radar_scan_still_moves_when_it_is_scrubbed() {
         h.gui_mut().pane(0).expect("pane 0").scan_info.is_none(),
         "precondition: this pane has never held a radar scan"
     );
-    let before = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let before = h.gui_mut().pane(0).expect("pane 0").time_mode();
 
     drag_rail(&mut h, 0.6, 0.2);
 
-    let after = h.gui_mut().pane(0).expect("pane 0").time.mode;
+    let after = h.gui_mut().pane(0).expect("pane 0").time_mode();
     assert_ne!(
         before, after,
         "a pane with no radar scan did not move when its rail was dragged: \
@@ -15755,8 +15761,10 @@ fn the_chip_names_a_forecast_loops_own_valid_time_and_says_forecast() {
         gui.preferences.timezone = squallar_units::TimezonePreference::Utc;
         let pane1 = gui.pane_mut(1).expect("pane 1");
         pane1.data_time = Some(neighbour_stamp);
-        assert!(pane1.viewing_live, "precondition: pane 1 follows live");
+        assert!(pane1.viewing_live(), "precondition: pane 1 follows live");
         let pane0 = gui.pane_mut(0).expect("pane 0");
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane0.begin_or_continue_loop();
         let ts = pane0.transport_state_mut();
         ts.phase = crate::pane::LoopPhase::Paused;
         ts.frames = (0..=18)
@@ -15799,11 +15807,27 @@ fn the_chip_names_a_forecast_loops_own_valid_time_and_says_forecast() {
 /// **A pane parked on a forecast frame keeps its forward step, rests its
 /// handle on the instant it depicts, and keeps its live posture** (WI-10).
 ///
-/// `viewing_live` means the *selection* follows live data, and it stays true
-/// here — which is exactly why the two widget reads must ask
-/// `depicts_future` instead. The last assertion is the control: a "fix" that
-/// cleared `viewing_live` on a future-depicting pane would green the two
-/// widget reads, and this test is built to red on that.
+/// `viewing_live` means the *selection* follows live data, and the two widget
+/// reads must ask `depicts_future` rather than it. The claims are held in the
+/// two states a forecast park really takes:
+///
+/// - **a park the user made on the archive rail** clears `viewing_live`, as
+///   every rail release, step and Set Time does: the forward step stays
+///   enabled and the handle rests on f12, not on the now boundary;
+/// - **a forecast loop parked on f12** keeps `viewing_live` — only a running
+///   loop moves the clock off now while the selection follows live data. Here
+///   the forward step must still be enabled, and that is the read that
+///   discriminates: a widget asking `viewing_live` instead of
+///   `depicts_future` disables it. The last assertion is the control: a "fix"
+///   that cleared `viewing_live` on a future-depicting pane would green that
+///   read, and this is built to red on that.
+///
+/// **It used to park a live-flagged pane on f12 with no loop running**, by
+/// writing the clock directly. No gesture reaches that state, and it is a live
+/// flag over a clock nothing running wrote — the state that showed discussions
+/// and alerts from hours before under a Live button painted live (report,
+/// 2026-09-12), which `PaneState::time_mode` now depicts as now. Every asserted
+/// value is unchanged; each sits on the state that produces it.
 ///
 /// **It used to read the control off `Gui::live_sites`**, and that stopped
 /// being a reading of `viewing_live` when `live_sites` gained its second term.
@@ -15813,22 +15837,18 @@ fn the_chip_names_a_forecast_loops_own_valid_time_and_says_forecast() {
 /// asks the posture directly instead, which is what it always meant.
 #[test]
 fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_live_posture() {
+    let now = chrono::Utc::now().naive_utc();
+    let f12 = now + chrono::Duration::hours(12);
+
+    // ── The archive rail: a park the user made ──────────────────────────────
     let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
     on_a_forecast_pane(&mut h);
-
-    let now = chrono::Utc::now().naive_utc();
     {
         let pane = h.gui_mut().pane_mut(0).expect("pane 0");
-        assert!(pane.viewing_live, "precondition: the pane follows live");
-        // Park on f12 by the clock: the posture is untouched, the instant
-        // depicted is twelve hours out.
-        pane.set_time_mode(crate::pane::TimeMode::AsOf(
-            now + chrono::Duration::hours(12),
-        ));
-        assert!(
-            pane.viewing_live,
-            "precondition: parking the clock must not clear the live posture"
-        );
+        assert!(pane.viewing_live(), "precondition: the pane follows live");
+        // A park clears the live flag, as every scrub, step and Set Time does.
+        pane.set_viewing_live(false);
+        pane.set_time_mode(crate::pane::TimeMode::AsOf(f12));
     }
     h.frames_for(2, 0.1);
 
@@ -15854,10 +15874,100 @@ fn a_pane_parked_on_a_forecast_frame_keeps_forward_step_and_its_live_posture() {
          end of the horizon"
     );
 
+    // ── The live posture: a forecast loop parked on f12 ─────────────────────
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    on_a_forecast_pane(&mut h);
+    {
+        let pane = h.gui_mut().pane_mut(0).expect("pane 0");
+        assert!(pane.viewing_live(), "precondition: the pane follows live");
+        let mut ls = crate::pane::LayerTimeState::new();
+        ls.phase = crate::pane::LoopPhase::Paused;
+        ls.frames = [now, now + chrono::Duration::hours(6), f12]
+            .into_iter()
+            .map(|timestamp| crate::pane::LoopFrame {
+                timestamp,
+                image: None,
+                render_in_flight: false,
+                render_failed: false,
+            })
+            .collect();
+        // Armed the way `App::handle_enable_loop` arms: the lineage door
+        // first, then the timeline.
+        pane.begin_or_continue_loop();
+        *pane.transport_state_mut() = ls;
+        // The loop's own park: the frame it is paused on.
+        pane.set_time_mode(crate::pane::TimeMode::AsOf(f12));
+        assert!(
+            pane.viewing_live(),
+            "precondition: parking the clock must not clear the live posture"
+        );
+    }
+    h.frames_for(2, 0.1);
+
     assert!(
-        h.gui_mut().pane(0).expect("pane 0").viewing_live,
+        h.timeline().fwd.1,
+        "forward-step is disabled on a live-following forecast loop parked \
+         twelve hours short of its horizon — `viewing_live` misread as \
+         `depicts now`"
+    );
+    assert!(
+        h.gui_mut().pane(0).expect("pane 0").viewing_live(),
         "the pane stopped following live data: the fix cleared `viewing_live` \
          instead of asking the right question"
+    );
+}
+
+/// **A restored paused forecast loop, waiting for its listing, rests the
+/// archive rail's handle on the frame it was paused on.**
+///
+/// The one reachable state in which the archive rail's resting read needs its
+/// `depicts_future` term: the pane follows live data, no timeline is running
+/// yet — so the archive rail is up, not the loop rail — and the clock is the
+/// restored loop's playhead on f12. Reading `viewing_live` alone rests the
+/// handle on the now boundary, twelve hours left of the frame the loop will
+/// resume on, and disables the forward step.
+#[test]
+fn a_restored_paused_forecast_loop_rests_its_handle_on_its_frame_before_it_arms() {
+    let f12 = chrono::Utc::now().naive_utc() + chrono::Duration::hours(12);
+    let mut h = InputHarness::with_screen(egui::vec2(1400.0, 900.0));
+    on_a_forecast_pane(&mut h);
+    {
+        let pane = h.gui_mut().pane_mut(0).expect("pane 0");
+        // What `load_ui_config` does for a live pane whose loop was paused.
+        pane.loop_arm_pending = Some(crate::pane::LoopArm { playing: false });
+        pane.restore_time_mode(crate::pane::TimeMode::AsOf(f12));
+        assert!(pane.viewing_live(), "precondition: the pane follows live");
+        assert!(
+            !pane.transport_state().is_active(),
+            "precondition: the loop has not armed yet"
+        );
+        assert_eq!(
+            pane.time_mode(),
+            crate::pane::TimeMode::AsOf(f12),
+            "precondition: the restored loop's frame is what the pane depicts"
+        );
+    }
+    h.frames_for(2, 0.1);
+
+    assert!(
+        h.timeline().fwd.1,
+        "forward-step is disabled on a pane resting twelve hours short of its \
+         horizon — `viewing_live` misread as `depicts now`"
+    );
+    let frac = h
+        .timeline()
+        .scrub_frac
+        .expect("precondition: the archive rail is up (no loop is running)");
+    assert!(
+        frac > crate::ui::NOW_SPLIT + 0.01,
+        "the handle rests at {frac:.3}, at or left of the now boundary \
+         ({:.2}) — hours left of the frame the paused loop will resume on",
+        crate::ui::NOW_SPLIT,
+    );
+    assert!(
+        frac < 0.99,
+        "the handle rests at {frac:.3}, the far right edge — f12 is not the \
+         end of the horizon"
     );
 }
 
@@ -16870,6 +16980,12 @@ fn rasters_over_a_swept_clock(
     minutes: i64,
 ) -> usize {
     let mut spent = 0;
+    // A swept clock is a scrub, and a scrub clears the live flag; a live pane
+    // with no loop running depicts now whatever its clock was last set to.
+    h.gui_mut()
+        .pane_mut(0)
+        .expect("pane 0")
+        .set_viewing_live(false);
     for step in 0..minutes {
         h.gui_mut()
             .pane_mut(0)

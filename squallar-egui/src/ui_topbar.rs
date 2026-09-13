@@ -371,7 +371,7 @@ impl super::Gui {
     /// the posture glyph in place of the room it does not have.
     fn phone_scan_summary(&self) -> String {
         let pane = self.active_pane();
-        let posture = if pane.viewing_live {
+        let posture = if pane.viewing_live() {
             "\u{23fa}"
         } else {
             "\u{23ee}"

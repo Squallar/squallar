@@ -262,7 +262,9 @@ mod span {
         let mut app = app_on_site();
         let pane = app.gui.pane_mut(0).unwrap();
         pane.time.span_secs = 0;
-        pane.time.mode = squallar_egui::pane::TimeMode::AsOf(volume_at(3));
+        // A park clears the live flag, as every scrub, step and Set Time does.
+        pane.set_viewing_live(false);
+        pane.set_time_mode(squallar_egui::pane::TimeMode::AsOf(volume_at(3)));
         let span =
             sounding_span_for_site(app.gui.panes(), SITE, now()).expect("a pane is on this site");
         assert_eq!(span, (volume_at(3).and_utc(), volume_at(3).and_utc()));

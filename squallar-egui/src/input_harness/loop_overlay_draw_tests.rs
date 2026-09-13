@@ -99,6 +99,13 @@ pub(super) fn model_loop(h: &mut InputHarness) -> (egui::TextureId, Vec<egui::Te
             render_failed: false,
         })
         .collect();
+    // The loop's layer is the pane's transport, as `refresh_transport` makes
+    // it before a loop is armed: only the transport's playback moves the clock,
+    // so a clock set while it runs is that loop's playhead.
+    h.gui_mut().panes_mut()[0].set_transport_layer(LAYER);
+    // Armed the way `App::handle_enable_loop` arms: the lineage door first, so
+    // the clock this loop's playhead writes is the loop's.
+    h.gui_mut().panes_mut()[0].begin_or_continue_loop();
     *h.gui_mut().panes_mut()[0].time_state_mut(&LAYER) = ls;
     h.warm_up();
     (live_id, frame_ids)

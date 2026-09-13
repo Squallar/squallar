@@ -248,7 +248,7 @@ fn the_other_panes_site_is_offered_with_the_pane_that_holds_it() {
     h.gui_mut().panes[1].set_site("KMKX".to_owned());
     // Parked in the archive, so `live_sites` would not report it. This section
     // is about what a pane is showing, which is a different question.
-    h.gui_mut().panes[1].viewing_live = false;
+    h.gui_mut().panes[1].set_viewing_live(false);
     h.warm_up();
 
     h.open_pane_props();

@@ -249,7 +249,7 @@ fn a_navigated_3d_pane_gets_nothing_from_a_live_arrival() {
     );
 
     let pane = app.gui.pane_mut(0).expect("pane 0");
-    pane.viewing_live = false;
+    pane.set_viewing_live(false);
     pane.scan_info = Some(squallar_radar::types::ScanInfo {
         site: squallar_radar::sites::get_radar_site(SITE)
             .expect("a known fixture site")

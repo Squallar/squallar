@@ -74,7 +74,7 @@ fn a_pane_opened_later_also_holds_a_radar_slot_and_asks_for_its_data() {
     gui.pane_mut(1)
         .expect("the layout just grew to two panes")
         .set_site("KOUN".to_string());
-    gui.pane_mut(1).expect("pane 1").viewing_live = true;
+    gui.pane_mut(1).expect("pane 1").set_viewing_live(true);
 
     let grown = gui.pane(1).expect("pane 1");
     assert!(
@@ -103,7 +103,7 @@ fn a_map_pane_with_radar_off_is_not_a_live_site() {
     {
         let pane = gui.pane_mut(0).expect("a fresh Gui has a pane");
         pane.set_site("KTLX".to_string());
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
         assert!(
             pane.is_map(),
             "premise: a fresh pane must be a map pane, or this test is about \
@@ -141,7 +141,7 @@ fn a_pane_that_draws_no_map_still_needs_its_volume() {
     let mut gui = Gui::new();
     let pane = gui.pane_mut(0).expect("a fresh Gui has a pane");
     pane.set_site("KTLX".to_string());
-    pane.viewing_live = true;
+    pane.set_viewing_live(true);
     pane.set_view(squallar_radar::types::RenderView::CrossSection);
     pane.set_overlay_enabled(known::RADAR, false);
 
@@ -175,7 +175,7 @@ fn switching_the_layer_back_on_makes_the_site_live_again() {
     {
         let pane = gui.pane_mut(0).expect("a fresh Gui has a pane");
         pane.set_site("KTLX".to_string());
-        pane.viewing_live = true;
+        pane.set_viewing_live(true);
         pane.set_overlay_enabled(known::RADAR, false);
     }
     assert_eq!(

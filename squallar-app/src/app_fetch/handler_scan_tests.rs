@@ -119,6 +119,8 @@ fn scrubbed_gui(at: chrono::NaiveDateTime) -> (Gui, Vec<LayerId>, Arc<AtomicU64>
         .collect();
     let mut gui = Gui::new();
     gui.overlays = OverlayRegistry::with_handlers(handlers);
+    // A park clears the live flag, as every scrub, step and Set Time does.
+    gui.pane_mut(0).expect("pane 0").set_viewing_live(false);
     gui.pane_mut(0)
         .expect("pane 0")
         .set_time_mode(TimeMode::AsOf(at));

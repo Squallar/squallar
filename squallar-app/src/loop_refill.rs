@@ -91,7 +91,7 @@ pub(crate) struct RefillAsk {
 /// * a frame qualifies — the ordinary case, and the one that must stay
 ///   silent, because a refill on every clock move is a refetch on every scrub.
 pub(crate) fn unserved_instant(pane: &PaneState) -> Option<NaiveDateTime> {
-    let TimeMode::AsOf(instant) = pane.time.mode else {
+    let TimeMode::AsOf(instant) = pane.time_mode() else {
         return None;
     };
     (!unserved_layers(pane).is_empty()).then_some(instant)
@@ -107,7 +107,7 @@ pub(crate) fn unserved_instant(pane: &PaneState) -> Option<NaiveDateTime> {
 /// every secondary timeline beside it is now asked the same question, which is
 /// the whole of what changed.
 pub(crate) fn unserved_layers(pane: &PaneState) -> Vec<LayerId> {
-    let mode = pane.time.mode;
+    let mode = pane.time_mode();
     if !matches!(mode, TimeMode::AsOf(_)) {
         return Vec::new();
     }

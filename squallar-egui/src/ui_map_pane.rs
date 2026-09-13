@@ -1578,7 +1578,7 @@ fn say_undrawn_still_radar(ctx: &PaneRenderCtx<'_>, draw_order: &[LayerId]) {
 /// `group_overlay_renders` shares one raster across panes on — so two panes on
 /// two instants get two rasters without anything else having to know.
 fn as_of_term(overlays: &OverlayRegistry, pane_idx: usize, pane: &PaneState, id: &LayerId) -> u64 {
-    let TimeMode::AsOf(instant) = pane.time.mode else {
+    let TimeMode::AsOf(instant) = pane.time_mode() else {
         return 0;
     };
     // **Asked of the registry's index, not of its handlers.** This resolved

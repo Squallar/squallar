@@ -634,7 +634,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
             pane.set_site("KDDC".to_owned());
             pane.set_selected_product(radar_fields::known::VELOCITY);
             pane.set_selected_elevation(1.5);
-            pane.viewing_live = false;
+            pane.set_viewing_live(false);
             pane.time.step = crate::pane::TimeStep::from_secs(1800);
             pane.time_state_mut(&known::RADAR).phase = LoopPhase::Playing;
             assert!(
@@ -655,7 +655,7 @@ fn converting_a_pane_tears_down_its_loop_and_nothing_else() {
         assert_eq!(pane.site(), "KDDC", "{view:?}: the site went with the loop");
         assert_eq!(pane.selected_product(), radar_fields::known::VELOCITY);
         assert_eq!(pane.selected_elevation(), 1.5);
-        assert!(!pane.viewing_live);
+        assert!(!pane.viewing_live());
         assert_eq!(pane.time.step.as_secs(), 1800);
 
         gui.pane_mut(0)
@@ -1186,6 +1186,8 @@ fn a_layer_link_sync_moves_the_stack_and_leaves_every_pane_on_its_own_clock() {
     // playheads, so neither assertion below can pass on a coincidence.
     for (idx, pane) in gui.panes.iter_mut().enumerate().take(2) {
         pane.layer_link = true;
+        // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+        pane.begin_or_continue_loop();
         let ls = pane.time_state_mut(&known::RADAR);
         ls.phase = crate::pane::LoopPhase::Playing;
         ls.frames = (0..(4 + idx as i64 * 2)).map(loop_frame).collect();

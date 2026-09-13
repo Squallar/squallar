@@ -52,6 +52,8 @@ fn frame(m: i64) -> LoopFrame {
 fn looping_pane(id: &LayerId, frames: &[i64]) -> PaneState {
     let mut pane = PaneState::new();
     pane.set_transport_layer(id.clone());
+    // Armed the way `App::handle_enable_loop` arms a loop: the lineage door first.
+    pane.begin_or_continue_loop();
     let ls = pane.transport_state_mut();
     ls.phase = LoopPhase::Ready;
     ls.span_secs = SPAN;
@@ -72,7 +74,7 @@ fn a_clock_before_every_frame_names_the_instant_nothing_answers_for() {
     pane.set_time_mode(TimeMode::AsOf(ts(30)));
 
     assert_eq!(
-        pane.transport_state().qualifying_frame_at(pane.time.mode),
+        pane.transport_state().qualifying_frame_at(pane.time_mode()),
         None,
         "premise: WI-3's rule says this pane draws nothing",
     );

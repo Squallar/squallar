@@ -64,7 +64,7 @@ fn field() -> FieldId {
 fn a_live_pane_is_about_the_newest_data_in_the_merge() {
     let pane = volume_pane();
     assert!(
-        pane.viewing_live,
+        pane.viewing_live(),
         "fixture precondition: a fresh pane is on the live feed",
     );
     let (stamp, base_started) = pane
@@ -86,7 +86,7 @@ fn a_live_pane_is_about_the_newest_data_in_the_merge() {
 #[test]
 fn a_navigated_pane_is_about_the_scan_it_stepped_back_to() {
     let mut pane = volume_pane();
-    pane.viewing_live = false;
+    pane.set_viewing_live(false);
     pane.scan_info = Some(ScanInfo {
         site: site(),
         site_source: squallar_radar::site_position::SitePositionSource::Table,

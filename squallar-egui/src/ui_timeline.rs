@@ -595,7 +595,7 @@ fn chip_word(
 ) -> &'static str {
     if t.is_some_and(|t| t > now) {
         "forecast"
-    } else if pane.viewing_live {
+    } else if pane.viewing_live() {
         "live"
     } else {
         "archive"
@@ -978,7 +978,7 @@ impl super::Gui {
         with_scrubber: bool,
     ) {
         let pane_idx = self.active_pane;
-        let viewing_live = self.panes[pane_idx].viewing_live;
+        let viewing_live = self.panes[pane_idx].viewing_live();
         // The forward-step's real question (WI-10): is there anywhere forward
         // of here? At the live edge there is not; parked on a forecast frame
         // there is — whatever `viewing_live` says about the selection posture.
@@ -1018,7 +1018,7 @@ impl super::Gui {
             self.probes.last_timeline.back = back.rect;
         }
         if back.clicked() {
-            self.panes[pane_idx].viewing_live = false;
+            self.panes[pane_idx].set_viewing_live(false);
             match step {
                 TimeStep::OneFrame => actions.push(GuiAction::NavigateOneScan {
                     pane_idx,
@@ -1207,13 +1207,13 @@ impl super::Gui {
         // the handle on the `now` boundary would paint it hours left of the
         // instant the pane depicts.
         let pane = &self.panes[pane_idx];
-        let resting = if pane.viewing_live && !pane.depicts_future(now) {
+        let resting = if pane.viewing_live() && !pane.depicts_future(now) {
             regions.split
         } else {
             // What the handle marks is the instant on screen. A forecast park
             // has no collected stamp there, so the clock is the mark; anywhere
             // else the data stamp stays the honest position.
-            let marked = match pane.time.mode {
+            let marked = match pane.time_mode() {
                 TimeMode::AsOf(t) if t > now => Some(t),
                 _ => pane.data_time_on_screen(),
             };
@@ -1330,7 +1330,7 @@ impl super::Gui {
             RailSide::Past => released,
             RailSide::Future => regions.snap_future(released),
         };
-        self.panes[pane_idx].viewing_live = false;
+        self.panes[pane_idx].set_viewing_live(false);
         // The release names an INSTANT, so say so: the pane's clock moves to
         // it and every layer on the pane is shown at that moment.
         self.panes[pane_idx].set_time_mode(TimeMode::AsOf(target));

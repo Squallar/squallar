@@ -201,12 +201,12 @@ fn unlinking_layers_leaves_the_clock_alone() {
     gui.set_active_pane_for_test(0);
     {
         let src = gui.pane_mut(0).expect("pane 0");
-        src.viewing_live = false;
+        src.set_viewing_live(false);
         src.time.step = TimeStep::from_secs(1800);
     }
     {
         let other = gui.pane_mut(1).expect("pane 1");
-        other.viewing_live = true;
+        other.set_viewing_live(true);
         other.time.step = TimeStep::from_secs(600);
     }
 
@@ -220,7 +220,7 @@ fn unlinking_layers_leaves_the_clock_alone() {
     gui.propagate_pane_sync();
 
     assert!(
-        !gui.pane(1).expect("pane 1").viewing_live,
+        !gui.pane(1).expect("pane 1").viewing_live(),
         "the clock must still fan out with the layer link off"
     );
     assert_eq!(
